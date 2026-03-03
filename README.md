@@ -56,12 +56,12 @@ sudo nmcli con add \
   ifname wlan0 \
   con-name PingPongHotspot \
   autoconnect yes \
-  ssid PingPongScorer \
+  ssid PingPong \
   mode ap \
   ipv4.method shared \
-  ipv4.addresses 192.168.4.1/24 \
+  ipv4.addresses 192.168.4.1/29 \
   wifi-sec.key-mgmt wpa-psk \
-  wifi-sec.psk "pingpong123" \
+  wifi-sec.psk "<supersecurepassword>" \
   802-11-wireless.band bg \
   802-11-wireless.channel 6
 ```
