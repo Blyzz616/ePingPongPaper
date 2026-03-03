@@ -34,11 +34,11 @@ pip3 install paho-mqtt --break-system-packages
 
 > **Alternatively, use a venv (cleaner):**
 > ```bash
-> python3 -m venv /home/pi/scorer-venv
-> source /home/pi/scorer-venv/bin/activate
+> python3 -m venv /home/jim/scorer-venv
+> source /home/jim/scorer-venv/bin/activate
 > pip install paho-mqtt
 > ```
-> Then point the systemd `ExecStart` at `/home/pi/scorer-venv/bin/python`.
+> Then point the systemd `ExecStart` at `/home/jim/scorer-venv/bin/python`.
 
 ---
 
@@ -133,8 +133,8 @@ mosquitto_pub -h 192.168.4.1 -t test -m hello
 
 ```bash
 sudo apt install -y git build-essential
-git clone https://github.com/waveshare/IT8951-ePaper /home/pi/IT8951-src
-cd /home/pi/IT8951-src
+git clone https://github.com/waveshare/IT8951-ePaper /home/jim/IT8951-src
+cd /home/jim/IT8951-src
 make
 sudo mkdir -p /IT8951
 sudo cp epd /IT8951/IT8951
@@ -149,10 +149,10 @@ Adjust `EPAPER_CMD` near the top of `pingpong.py` if your binary path differs.
 
 ```bash
 # Normal (MQTT + display) mode
-python3 /home/pi/pingpong.py
+python3 /home/jim/pingpong.py
 
 # Simulation mode — no MQTT or display hardware needed
-python3 /home/pi/pingpong.py --sim
+python3 /home/jim/pingpong.py --sim
 ```
 
 ### Simulation commands
@@ -229,8 +229,8 @@ After=network-online.target mosquitto.service
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/bin/python3 /home/pi/pingpong.py
-WorkingDirectory=/home/pi
+ExecStart=/usr/bin/python3 /home/jim/pingpong.py
+WorkingDirectory=/home/jim
 Restart=always
 RestartSec=5
 User=pi
