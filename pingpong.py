@@ -120,6 +120,36 @@ class GameState:
     """
     Immutable-ish snapshot of the entire match.
     We deep-copy this onto the undo stack before every mutation.
+
+    SCORE MODEL — POSITIONAL, NOT BY COLOUR
+    ----------------------------------------
+    Scores and game-win counts are stored by *side* (left / right), not by
+    button colour (green / blue).  This is the key design decision that makes
+    the side-swap logic correct:
+
+        Green is ALWAYS the left button.
+        Blue  is ALWAYS the right button.
+
+    When players physically swap ends between games, the person who was on
+    the left moves to the right and vice versa.  From the scoreboard's point
+    of view the LEFT column still belongs to whoever is standing on the left —
+    which is now the person who was previously on the right.
+
+    Concretely: if Andrew starts on the left (green) and wins game 1, the
+    scoreboard shows  Games 1–0.  After swapping, Andrew is on the right
+    (blue), so game 2 starts as  Games 0–1  — the LEFT column has reset to 0
+    because the left side is now Bill, who has 0 game wins.
+
+    Implementation:
+        self.score      = {"left": 0, "right": 0}   # points in current game
+        self.games_won  = {"left": 0, "right": 0}   # games won in match
+
+    Button colour → side mapping (fixed for the whole match):
+        green button  → always LEFT
+        blue button   → always RIGHT
+
+    "server" is stored as a side ("left" | "right") so it survives swaps
+    naturally — the server label stays with the physical side, not the player.
     """
 
     def __init__(self):
@@ -128,21 +158,17 @@ class GameState:
         self.best_of      = 3         # 3 or 5
 
         # ── Match progress ─────────────────────────────────────────────────
-        self.games_won    = {"green": 0, "blue": 0}  # games won in match
+        # Stored by side (left/right).  Sides swap each game, so the numbers
+        # flip automatically — exactly what the spec requires.
+        self.games_won    = {"left": 0, "right": 0}
         self.current_game = 1         # 1-based game counter
 
-        # ── Current game score ─────────────────────────────────────────────
-        # left / right are the *sides*, which swap each game.
-        # green and blue always refer to the physical button colour.
-        # We track by colour internally; display maps to side.
-        self.score        = {"green": 0, "blue": 0}
-
-        # ── Sides ──────────────────────────────────────────────────────────
-        # which colour is currently on the LEFT side
-        self.left_player  = "green"   # "green" or "blue"
+        # ── Current game score (positional) ────────────────────────────────
+        self.score        = {"left": 0, "right": 0}
 
         # ── Serve ──────────────────────────────────────────────────────────
-        self.server       = "green"   # colour of current server
+        # server is "left" or "right" (the side, not the colour).
+        self.server       = "left"    # side of current server
         self.serve_count  = 1         # 1 or 2 within this server's turn
 
         # ── State machine ──────────────────────────────────────────────────
@@ -153,26 +179,32 @@ class GameState:
 
         # ── WIN_CONFIRM prompt ─────────────────────────────────────────────
         # After best-of-3 we ask "extend to 5?". True = yes-question active.
-        self.extend_prompt = False
-        self.game_winner  = None      # colour of game winner (set at WIN_CONFIRM)
+        self.extend_prompt  = False
+        self.game_winner    = None    # side ("left"|"right") of game winner
 
         # ── History of game scores (for match summary) ──────────────────────
-        # list of {"green": g_score, "blue": b_score, "winner": colour}
+        # list of {"left": l_score, "right": r_score, "winner": side}
         self.game_history = []
 
-    def right_player(self):
-        """Return the colour on the right side."""
-        return "blue" if self.left_player == "green" else "green"
+    # ── Colour → side helpers (green is always left, blue always right) ────
 
-    def score_left(self):
-        return self.score[self.left_player]
+    @staticmethod
+    def colour_to_side(colour: str) -> str:
+        """Map button colour to physical side. Always green=left, blue=right."""
+        return "left" if colour == "green" else "right"
 
-    def score_right(self):
-        return self.score[self.right_player()]
+    @staticmethod
+    def side_to_colour(side: str) -> str:
+        """Map physical side to button colour."""
+        return "green" if side == "left" else "blue"
 
-    def server_side(self):
-        """Return 'Left' or 'Right' based on who is serving."""
-        return "Left" if self.server == self.left_player else "Right"
+    def server_colour(self) -> str:
+        """Return the colour of the current server."""
+        return self.side_to_colour(self.server)
+
+    def server_side_label(self) -> str:
+        """Return 'Left' or 'Right' (capitalised) for the current server."""
+        return self.server.capitalize()
 
     def clone(self):
         return copy.deepcopy(self)
@@ -236,9 +268,10 @@ class MatchLogger:
         """
         Emit:   Green/Left serving (1)
         Called immediately after any serve change or game start.
+        server is stored as a side ("left"/"right"); colour is derived.
         """
-        colour = gs.server.capitalize()
-        side   = gs.server_side()
+        colour = gs.server_colour().capitalize()   # "Green" or "Blue"
+        side   = gs.server_side_label()            # "Left"  or "Right"
         n      = gs.serve_count
         self.write(f"{colour}/{side} serving ({n})")
 
@@ -420,35 +453,35 @@ class DisplayManager:
     @staticmethod
     def score_key(gs: GameState) -> str:
         """
-        Canonical key for a score screen.
-        e.g.  score_G3_B7_sv_green_s2_gm2
+        Canonical key for a score screen — fully positional.
+        e.g.  score_L3_R7_svL_s2_gm2_gl1_rg0
+        (L=left points, R=right points, sv=serving side, s=serve number,
+         gm=game number, gl=games won by left, rg=games won by right)
         """
         return (
-            f"score_G{gs.score['green']}_B{gs.score['blue']}"
+            f"score_L{gs.score['left']}_R{gs.score['right']}"
             f"_sv{gs.server}_s{gs.serve_count}"
             f"_gm{gs.current_game}"
-            f"_gl{gs.games_won['green']}_bl{gs.games_won['blue']}"
+            f"_gl{gs.games_won['left']}_rg{gs.games_won['right']}"
         )
 
     # ── Pre-generation helpers ────────────────────────────────────────────
 
     def _gen_score_screen(self, gs: GameState, key: str):
         """Render a score BMP for the given game state."""
-        left  = gs.left_player
-        right = gs.right_player()
         outfile = os.path.join(IMAGE_DIR, f"{key}.bmp")
         if os.path.exists(self._resolve(key)):
             return   # already exists or override present
         self._make_score_bmp(
-            left_score   = gs.score[left],
-            right_score  = gs.score[right],
-            left_label   = left.capitalize(),
-            right_label  = right.capitalize(),
-            server_side  = gs.server_side().lower(),
+            left_score   = gs.score["left"],
+            right_score  = gs.score["right"],
+            left_label   = "Green",   # green is always left button
+            right_label  = "Blue",    # blue  is always right button
+            server_side  = gs.server,
             serve_count  = gs.serve_count,
             game_num     = gs.current_game,
-            games_left   = gs.games_won[left],
-            games_right  = gs.games_won[right],
+            games_left   = gs.games_won["left"],
+            games_right  = gs.games_won["right"],
             outfile      = outfile
         )
 
@@ -457,23 +490,23 @@ class DisplayManager:
         After any score change, immediately render the three most likely
         next screens in a background thread so they are ready instantly:
           1. Current state (already displayed, but regenerate if missing)
-          2. Left player scores next
-          3. Right player scores next
-          4. Undo (previous state – stored separately by the engine)
+          2. Left side scores next  (green button pressed)
+          3. Right side scores next (blue button pressed)
+        All simulation is purely positional (left/right).
         """
         def _work():
             with self._pregen_lock:
                 # Current
                 self._gen_score_screen(gs, self.score_key(gs))
 
-                # --- Simulate left scores ---
+                # Left side scores next
                 gs_l = gs.clone()
-                _apply_point(gs_l, gs_l.left_player)
+                _apply_point(gs_l, "left")
                 self._gen_score_screen(gs_l, self.score_key(gs_l))
 
-                # --- Simulate right scores ---
+                # Right side scores next
                 gs_r = gs.clone()
-                _apply_point(gs_r, gs_r.right_player())
+                _apply_point(gs_r, "right")
                 self._gen_score_screen(gs_r, self.score_key(gs_r))
 
         t = threading.Thread(target=_work, daemon=True)
@@ -493,73 +526,103 @@ class DisplayManager:
 
 # =============================================================================
 #  PURE GAME LOGIC  (stateless helpers – operate on GameState clones)
+#
+#  All functions work in terms of "left" and "right" sides.
+#  Button colour → side translation happens only at the engine boundary
+#  (handle_button / _handle_score) via GameState.colour_to_side().
 # =============================================================================
 
-def _advance_serve(gs: GameState):
+def _advance_serve(gs: GameState) -> bool:
     """
-    Advance the serve counter.  2 serves per player always,
-    even at deuce.  Modifies gs in-place.
-    Returns True if there was a change of server.
+    Advance the serve counter.  2 serves per side always, even at deuce.
+    Modifies gs in-place.
+    Returns True if there was a change of server (i.e. server rotated).
     """
     if gs.serve_count == 1:
         gs.serve_count = 2
         return False   # same server, second serve
     else:
-        # rotate server
+        # Rotate to the other side
         gs.serve_count = 1
-        gs.server = gs.right_player() if gs.server == gs.left_player else gs.left_player
+        gs.server = "right" if gs.server == "left" else "left"
         return True    # server changed
 
 
-def _apply_point(gs: GameState, scorer: str):
+def _apply_point(gs: GameState, side: str) -> bool:
     """
-    Award a point to scorer (colour string).
+    Award a point to the given side ("left" or "right").
     Advance serve counter.
-    Does NOT check for game win – use check_game_win() for that.
+    Does NOT check for game win – use check_game_win() after calling this.
     Modifies gs in-place.
     Returns True if there was a change of server.
     """
-    gs.score[scorer] += 1
+    gs.score[side] += 1
     return _advance_serve(gs)
 
 
 def check_game_win(gs: GameState):
     """
-    Return the winning colour if the current game is over, else None.
-    Win condition: score >= race_to AND lead >= 2.
+    Return the winning side ("left" | "right") if the current game is over,
+    else None.
+    Win condition: score >= race_to AND lead >= 2 (win-by-two rule).
     """
-    g = gs.score["green"]
-    b = gs.score["blue"]
-    needed = gs.race_to
-    if g >= needed or b >= needed:
-        if abs(g - b) >= 2:
-            return "green" if g > b else "blue"
+    l = gs.score["left"]
+    r = gs.score["right"]
+    if l >= gs.race_to or r >= gs.race_to:
+        if abs(l - r) >= 2:
+            return "left" if l > r else "right"
     return None
 
 
-def _swap_sides(gs: GameState):
-    """Swap left/right player assignment."""
-    gs.left_player = gs.right_player()
+def swap_games_won(gs: GameState):
+    """
+    When players physically change ends between games, the left/right
+    game-win counts must also swap so they stay positional.
+
+    Example: Andrew won game 1 while on the left → games_won = {left:1, right:0}.
+    After swapping ends, Andrew is on the right, so the same fact is now
+    expressed as games_won = {left:0, right:1}.
+    """
+    gs.games_won["left"], gs.games_won["right"] = (
+        gs.games_won["right"],
+        gs.games_won["left"],
+    )
 
 
-def start_new_game(gs: GameState, winner_of_last: str):
+def start_new_game(gs: GameState, winning_side: str):
     """
-    Reset per-game score, swap sides, set winner as server.
-    Call AFTER recording the completed game in game_history.
+    Prepare for the next game:
+      1. Record the winning side BEFORE swapping (caller already appended history).
+      2. Swap games_won so they remain positional after the side change.
+      3. Reset per-game points to 0–0.
+      4. Increment game counter.
+      5. Set winning_side as the server for the new game.
+         (winning_side is passed in BEFORE the swap, so after the swap the
+          winner is on the opposite side — we flip it here.)
+
+    The serve is awarded to the player who won the previous game, regardless
+    of which side they are now on.  Because winning_side was their side
+    BEFORE the swap, after the swap they are on the other side.
     """
-    gs.score      = {"green": 0, "blue": 0}
+    # After the swap, the winner is on the opposite side to winning_side.
+    new_server = "right" if winning_side == "left" else "left"
+
+    swap_games_won(gs)          # flip games_won to match new positions
+    gs.score        = {"left": 0, "right": 0}
     gs.current_game += 1
-    _swap_sides(gs)
-    gs.server     = winner_of_last
-    gs.serve_count = 1
+    gs.server       = new_server
+    gs.serve_count  = 1
 
 
 def match_winner(gs: GameState):
-    """Return the colour that has won the match, or None."""
+    """
+    Return the winning side ("left" | "right") if the match is decided,
+    else None.  Uses current positional games_won.
+    """
     needed = (gs.best_of // 2) + 1   # 2 for BO3, 3 for BO5
-    for colour in ("green", "blue"):
-        if gs.games_won[colour] >= needed:
-            return colour
+    for side in ("left", "right"):
+        if gs.games_won[side] >= needed:
+            return side
     return None
 
 
@@ -678,18 +741,17 @@ class MatchEngine:
 
         elif state == State.SERVING_CHOICE:
             self._push_undo()
-            # The player who presses first will serve first
-            # Their side is always their colour: green=left, blue=right
-            gs.server      = colour
+            # Translate the button colour to a side — green=left, blue=right.
+            # That side becomes the first server.
+            side = GameState.colour_to_side(colour)
+            gs.server      = side
             gs.serve_count = 1
             gs.state       = State.PLAYING
-            side = "Left" if colour == gs.left_player else "Right"
             self.logger.event(
                 f"{colour.capitalize()} button pressed. "
-                f"{colour.capitalize()} on {side}."
+                f"{colour.capitalize()} on {side.capitalize()} serves first."
             )
             self.logger.blank()
-            # Print first serve header
             self.logger.serve_header(gs)
             self._show_score()
             self.display.pregenerate_score_screens(gs)
@@ -707,19 +769,21 @@ class MatchEngine:
     # ── Scoring ───────────────────────────────────────────────────────────
 
     def _handle_score(self, colour: str):
-        """Award a point to the player who pressed their button."""
+        """
+        Award a point to the side that matches the pressed button colour.
+        Green button → left side.  Blue button → right side.
+        All score/games_won tracking is positional (left/right).
+        """
         gs = self.gs
         self._push_undo()
 
-        prev_server     = gs.server
-        prev_serve_count = gs.serve_count
+        # Translate button colour to the physical side it always occupies.
+        side = GameState.colour_to_side(colour)
 
-        changed_server = _apply_point(gs, colour)
+        changed_server = _apply_point(gs, side)
 
-        left  = gs.left_player
-        right = gs.right_player()
-        left_score  = gs.score[left]
-        right_score = gs.score[right]
+        left_score  = gs.score["left"]
+        right_score = gs.score["right"]
         score_str   = f"{left_score}-{right_score}"
 
         # ── Log the point ──────────────────────────────────────────────────
@@ -729,27 +793,32 @@ class MatchEngine:
         )
 
         # ── Check for game win ─────────────────────────────────────────────
-        winner = check_game_win(gs)
-        if winner:
+        winning_side = check_game_win(gs)
+        if winning_side:
+            # Record the final points score for this game BEFORE resetting.
             gs.game_history.append({
-                "green": gs.score["green"],
-                "blue":  gs.score["blue"],
-                "winner": winner
+                "left":  gs.score["left"],
+                "right": gs.score["right"],
+                "winner_side":   winning_side,
+                "winner_colour": GameState.side_to_colour(winning_side),
             })
-            gs.games_won[winner] += 1
-            gs.game_winner = winner
+            # Award the game win to the winning side (positional).
+            gs.games_won[winning_side] += 1
+            gs.game_winner = winning_side
 
             if changed_server:
                 self.logger.serve_change()
             else:
                 self.logger.blank()
 
+            winner_colour = GameState.side_to_colour(winning_side)
             self.logger.event(
-                f"{winner.capitalize()} wins game {gs.current_game}! "
-                f"Score: {gs.games_won['green']}-{gs.games_won['blue']} in games."
+                f"{winner_colour.capitalize()} wins game {gs.current_game}! "
+                f"Games: {gs.games_won['left']}–{gs.games_won['right']} "
+                f"(left–right)"
             )
 
-            # Check for match win
+            # Check for match win BEFORE calling start_new_game (which swaps).
             m_winner = match_winner(gs)
             if m_winner:
                 gs.state = State.MATCH_OVER
@@ -760,22 +829,13 @@ class MatchEngine:
             gs.state = State.WIN_CONFIRM
             self._win_confirmed = {"green": False, "blue": False}
 
-            # Special case: after game 3 of a best-of-3, offer to extend
-            games_played = sum(gs.games_won.values())
-            if gs.best_of == 3 and games_played == 3:
-                # One player just won the match already → match over (caught above)
-                # This branch: score is 2-1 (someone needs to win a 4th game)
-                # Actually if best_of==3 and no match winner yet, it's 1-1 after game 2.
-                # After game 3 one player has 2 wins = match winner → caught above.
-                # So this branch handles asking "extend to 5?" after game 2 (1-1 score).
-                pass
-
-            # After game N of best-of-3 at 1-1: offer extend
-            if gs.best_of == 3 and gs.games_won["green"] == 1 and gs.games_won["blue"] == 1:
+            # After game 2 of a best-of-3 with scores 1–1: offer to extend.
+            total_games = gs.games_won["left"] + gs.games_won["right"]
+            if gs.best_of == 3 and total_games == 2:
                 gs.extend_prompt = True
                 self._show_extend_prompt()
             else:
-                self._show_win_confirm(winner)
+                self._show_win_confirm(winning_side)
             return
 
         # ── Normal point: log serve info ───────────────────────────────────
@@ -787,7 +847,6 @@ class MatchEngine:
 
         # ── Update display ─────────────────────────────────────────────────
         key = DisplayManager.score_key(gs)
-        # Try to show pre-generated image; fall back to generating now
         target = self.display._resolve(key)
         if not os.path.exists(target):
             self.display._gen_score_screen(gs, key)
@@ -802,7 +861,8 @@ class MatchEngine:
         gs = self.gs
 
         if gs.extend_prompt:
-            # Green = Yes (extend to 5), Blue = No (end match)
+            # Green button (left) = YES extend to 5.
+            # Blue button (right) = NO, end match now.
             if colour == "blue":
                 self.logger.event("Blue button pressed. Players chose NOT to extend to best of 5.")
                 gs.state = State.MATCH_OVER
@@ -812,10 +872,8 @@ class MatchEngine:
                 self._push_undo()
                 gs.best_of       = 5
                 gs.extend_prompt = False
-                # Continue – start next game
-                winner = gs.game_winner
-                gs.game_history_at_extend = len(gs.game_history)
-                start_new_game(gs, winner)
+                winning_side     = gs.game_winner   # side that won the last game
+                start_new_game(gs, winning_side)    # swaps sides + games_won
                 gs.state = State.PLAYING
                 self.logger.blank()
                 self.logger.serve_header(gs)
@@ -823,16 +881,17 @@ class MatchEngine:
                 self.display.pregenerate_score_screens(gs)
             return
 
-        # Normal end-of-game confirmation: both players short-press
+        # Normal end-of-game: both players short-press to confirm.
         self._win_confirmed[colour] = True
+        both = all(self._win_confirmed.values())
         self.logger.event(
             f"{colour.capitalize()} confirmed. "
-            f"{'Both confirmed – starting next game.' if all(self._win_confirmed.values()) else 'Waiting for other player.'}"
+            f"{'Both confirmed – starting next game.' if both else 'Waiting for other player.'}"
         )
-        if all(self._win_confirmed.values()):
+        if both:
             self._push_undo()
-            winner = gs.game_winner
-            start_new_game(gs, winner)
+            winning_side = gs.game_winner
+            start_new_game(gs, winning_side)   # swaps sides + games_won
             gs.state = State.PLAYING
             self.logger.blank()
             self.logger.serve_header(gs)
@@ -842,18 +901,16 @@ class MatchEngine:
     # ── Undo ──────────────────────────────────────────────────────────────
 
     def _handle_undo(self, colour: str):
-        """Undo the last action."""
+        """Undo the last action and restore the previous state."""
         if not self._undo_stack:
             self.logger.event(f"{colour.capitalize()} double pressed. Nothing to undo.")
             return
 
-        prev = self.gs.clone()   # keep current to log from
         self._pop_undo()
         gs = self.gs
 
-        left_score  = gs.score[gs.left_player]
-        right_score = gs.score[gs.right_player()]
-        score_str   = f"{left_score}-{right_score}"
+        # Score is positional — read directly from left/right.
+        score_str = f"{gs.score['left']}-{gs.score['right']}"
 
         self.logger.event(
             f"{colour.capitalize()} double pressed. Score reverted. {score_str}"
@@ -861,7 +918,7 @@ class MatchEngine:
         self.logger.blank()
         self.logger.serve_header(gs)
 
-        # Refresh display
+        # Refresh display for the restored state.
         if gs.state == State.PLAYING:
             key = DisplayManager.score_key(gs)
             target = self.display._resolve(key)
@@ -967,13 +1024,14 @@ class MatchEngine:
             self.display._gen_score_screen(gs, key)
         self.display.show(key)
 
-    def _show_win_confirm(self, winner: str):
+    def _show_win_confirm(self, winning_side: str):
         gs = self.gs
+        winner_colour = GameState.side_to_colour(winning_side)
         lines = [
             f"Game {gs.current_game} over!",
             "",
-            f"{winner.capitalize()} wins!",
-            f"Games: Green {gs.games_won['green']} – {gs.games_won['blue']} Blue",
+            f"{winner_colour.capitalize()} ({winning_side}) wins!",
+            f"Games:  Left {gs.games_won['left']} – {gs.games_won['right']} Right",
             "",
             "Both players press to start next game.",
         ]
@@ -983,39 +1041,43 @@ class MatchEngine:
     def _show_extend_prompt(self):
         gs = self.gs
         lines = [
-            "Games tied 1–1!",
+            f"Games tied  {gs.games_won['left']}–{gs.games_won['right']}!",
             "",
             "Extend to Best of 5?",
             "",
-            "GREEN = YES   |   BLUE = NO",
+            "GREEN (left) = YES   |   BLUE (right) = NO",
         ]
         self.display.generate_and_show_menu("extend_prompt", lines)
         self.logger.event("Asking players if they want to extend to best of 5.")
 
     def _show_match_summary(self):
         gs = self.gs
-        w  = match_winner(gs)
+        w  = match_winner(gs)   # "left" or "right" side
+        w_colour = GameState.side_to_colour(w) if w else "unknown"
         lines = ["=== MATCH OVER ===", ""]
         for i, g in enumerate(gs.game_history, 1):
+            wc = g["winner_colour"].capitalize()
+            ws = g["winner_side"].capitalize()
             lines.append(
-                f"Game {i}: Green {g['green']} – {g['blue']} Blue  "
-                f"({g['winner'].capitalize()} wins)"
+                f"Game {i}: Left {g['left']} – {g['right']} Right  "
+                f"({wc}/{ws} wins)"
             )
         lines += [
             "",
-            f"Games: Green {gs.games_won['green']} – {gs.games_won['blue']} Blue",
+            f"Games:  Left {gs.games_won['left']} – {gs.games_won['right']} Right",
             "",
-            f"WINNER: {w.upper() if w else '???'}",
+            f"WINNER: {w_colour.upper()} ({w.upper() if w else '???'} side)",
             "",
-            "Long press to play again.",
+            "Long press either button to play again.",
         ]
         key = "match_summary"
         self.display.generate_and_show_menu(key, lines, font_size=42)
         self.logger.blank()
-        self.logger.event(f"=== MATCH OVER. Winner: {w} ===")
+        self.logger.event(f"=== MATCH OVER. Winner: {w_colour} ({w} side) ===")
         for i, g in enumerate(gs.game_history, 1):
             self.logger.event(
-                f"  Game {i}: Green {g['green']} – {g['blue']} Blue ({g['winner']} wins)"
+                f"  Game {i}: Left {g['left']} – {g['right']} Right "
+                f"({g['winner_colour']} wins)"
             )
 
     def _redraw_current_state(self):
