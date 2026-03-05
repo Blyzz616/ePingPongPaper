@@ -1,53 +1,62 @@
 #!/usr/bin/env python3
 """
 =============================================================================
- Ping-Pong Scoring System for Raspberry Pi Zero W v1
- IT8951 800x600 monochrome e-paper display + 2x ESP32-C6 buttons over MQTT
+ Ping-Pong Scoring System — Raspberry Pi Zero W v1
+ IT8951 800x600 e-paper  +  2x ESP32-C6 buttons over MQTT
 =============================================================================
 
-ARCHITECTURE OVERVIEW
----------------------
- - The Pi acts as a Wi-Fi Access Point (hostapd + dnsmasq).
- - A local Mosquitto MQTT broker runs on the Pi.
- - Each ESP32-C6 connects to the AP, then publishes to:
-     button/green  (payloads: short | double | long)
-     button/blue   (payloads: short | double | long)
-   and subscribes to:
-     status/green  /  status/blue  (for connection acknowledgement)
- - The Pi subscribes to both button topics.
+IMAGE PIPELINE OVERVIEW
+-----------------------
+All artwork is pre-made by Jim and lives in /home/jim/images/.
+This script never generates background artwork — it only *composites*
+pre-made layers together with ImageMagick.
 
-STATE MACHINE
--------------
-  WAITING_BUTTONS  → both ESP32s must connect before anything else
-  RULE_RACE        → green=Race11, blue=Race21
-  RULE_BO          → green=BestOf3, blue=BestOf5
-  CONFIRM_RULES    → both players short-press to confirm
-  SERVING_CHOICE   → first press picks server (green=green serves, blue=blue serves)
-  PLAYING          → live scoring
-  WIN_CONFIRM      → end-of-game confirmation / extend-to-5 offer
-  MATCH_OVER       → display summary, long-press resets
+Setup / rule-selection screens (shown directly via IT8951):
+  gamelen.bmp          -> shown as soon as both buttons connect
+  gl11.bmp             -> shown after green tap  (race-to-11 chosen)
+  gl21.bmp             -> shown after blue tap   (race-to-21 chosen)
+  gl11bo3conf.bmp      -> confirmation: race-to-11, best-of-3
+  gl11bo5conf.bmp      -> confirmation: race-to-11, best-of-5
+  gl21bo3conf.bmp      -> confirmation: race-to-21, best-of-3
+  gl21bo5conf.bmp      -> confirmation: race-to-21, best-of-5
+  serve.bmp            -> "who serves first?" prompt
 
-DISPLAY PIPELINE
-----------------
-  ImageMagick  →  BMP file  →  /IT8951/IT8951 0 0 <file>
+In-game base images (background layer for score composites):
+  gl11bo3.bmp          -> race-to-11, best-of-3
+  gl11bo5.bmp          -> race-to-11, best-of-5
+  gl21bo3.bmp          -> race-to-21, best-of-3
+  gl21bo5.bmp          -> race-to-21, best-of-5
 
-  All "next possible" screens are pre-generated immediately after any state
-  change so the display update is instant when the next button is pressed.
+Serve indicator overlays (composited onto base):
+  serveleft.bmp        -> placed at x=0,   y=0
+  serveright.bmp       -> placed at x=518, y=0
+
+Score digit images (0.bmp ... 41.bmp, each 33x215 px):
+  Left  digit: x=35,  y=218
+  Right digit: x=424, y=218
+
+PRE-GENERATION STRATEGY
+-----------------------
+After every serve starts (including the very first one after the serve
+choice), we immediately build the two next possible score BMPs in a
+background thread:
+
+  /tmp/<serve_num:02d>.<left+1>-<right>.bmp   (left scores)
+  /tmp/<serve_num:02d>.<left>-<right+1>.bmp   (right scores)
+
+serve_num is a global monotonic counter (never reset, even across games).
+It uniquely identifies each "serve slot" for the undo system.
+
+When a button is pressed we show the already-built image instantly,
+advance the state, then kick off the next pair of pre-generations.
 
 UNDO
 ----
-  A full copy of the game state is pushed onto a stack before every mutation.
-  Double-press pops the stack and restores the previous state, then
-  re-displays and re-pre-generates from that restored state.
-
-LOGGING
--------
-  File: logs/<epoch>.txt
-  Format follows the specification exactly, including serve headers,
-  blank lines, and "Change of serve" markers.
+GameState is deep-copied onto a stack before every mutation.
+serve_num is part of GameState, so pop-and-restore gives us back the
+exact filename of the image we need to re-display — no extra bookkeeping.
 """
 
-# ── Standard library ──────────────────────────────────────────────────────────
 import copy
 import os
 import queue
@@ -60,43 +69,77 @@ import logging
 from datetime import datetime
 from enum import Enum, auto
 
-# ── Third-party ───────────────────────────────────────────────────────────────
 try:
     import paho.mqtt.client as mqtt
     MQTT_AVAILABLE = True
 except ImportError:
     MQTT_AVAILABLE = False
-    print("[WARN] paho-mqtt not installed – MQTT disabled, simulation mode only.")
+    print("[WARN] paho-mqtt not installed – simulation mode only.")
 
 # =============================================================================
-#  CONFIGURATION  (edit these to match your hardware / network)
+#  CONFIGURATION
 # =============================================================================
 
-MQTT_BROKER_HOST   = "localhost"   # Pi is the broker
-MQTT_BROKER_PORT   = 1883
-MQTT_KEEPALIVE     = 60
-MQTT_TOPIC_GREEN   = "button/green"
-MQTT_TOPIC_BLUE    = "button/blue"
-MQTT_STATUS_GREEN  = "status/green"
-MQTT_STATUS_BLUE   = "status/blue"
-MQTT_RECONNECT_DELAY = 5           # seconds between reconnect attempts
+MQTT_BROKER_HOST     = "localhost"
+MQTT_BROKER_PORT     = 1883
+MQTT_KEEPALIVE       = 60
+MQTT_TOPIC_GREEN     = "button/green"
+MQTT_TOPIC_BLUE      = "button/blue"
+MQTT_STATUS_GREEN    = "status/green"
+MQTT_STATUS_BLUE     = "status/blue"
+MQTT_RECONNECT_DELAY = 5
 
-EPAPER_CMD         = "/IT8951/IT8951"   # path to the IT8951 display binary
-DISPLAY_WIDTH      = 800
-DISPLAY_HEIGHT     = 600
-IMAGE_DIR          = "/tmp/pingpong_imgs"   # working directory for BMP files
-LOG_DIR            = "logs"
+EPAPER_CMD  = "/IT8951/IT8951"   # path to the IT8951 display binary
 
-# ImageMagick font / style (tweak to taste)
-IM_FONT            = "DejaVu-Sans-Bold"
-IM_BG              = "white"
-IM_FG              = "black"
-SCORE_FONT_SIZE    = 220   # huge score digits
-LABEL_FONT_SIZE    = 48
-STATUS_FONT_SIZE   = 36
+# Jim's pre-made artwork
+ASSETS = "/home/jim/images"
 
-# Button timing (used in simulation mode; ESP32 handles real debounce)
-SIMULATION_MODE    = "--sim" in sys.argv
+# Where composited score images are written
+TMP_DIR = "/tmp"
+
+# Score digit image dimensions (Jim's files are 33x215 px)
+DIGIT_W = 33
+DIGIT_H = 215
+
+# Pixel positions where score digits are composited onto the base image
+LEFT_SCORE_X  = 35
+LEFT_SCORE_Y  = 218
+RIGHT_SCORE_X = 424
+RIGHT_SCORE_Y = 218
+
+# Pixel positions where serve overlays are composited onto the base image
+SERVE_LEFT_X  = 0
+SERVE_LEFT_Y  = 0
+SERVE_RIGHT_X = 518
+SERVE_RIGHT_Y = 0
+
+LOG_DIR = "logs"
+
+SIMULATION_MODE = "--sim" in sys.argv
+
+
+# =============================================================================
+#  ASSET PATH HELPERS
+# =============================================================================
+
+def asset(name: str) -> str:
+    """Full path to a file in Jim's images directory."""
+    return os.path.join(ASSETS, name)
+
+
+def digit_path(n: int) -> str:
+    """Full path to the pre-made digit BMP for number n."""
+    return asset(f"{n}.bmp")
+
+
+def tmp_score_path(serve_num: int, left: int, right: int) -> str:
+    """
+    Full path for a pre-generated score composite in /tmp.
+    Format:  /tmp/<serve_num:02d>.<left>-<right>.bmp
+    Example: /tmp/01.1-0.bmp
+    """
+    return os.path.join(TMP_DIR, f"{serve_num:02d}.{left}-{right}.bmp")
+
 
 # =============================================================================
 #  STATE DEFINITIONS
@@ -104,106 +147,82 @@ SIMULATION_MODE    = "--sim" in sys.argv
 
 class State(Enum):
     WAITING_BUTTONS = auto()   # waiting for both ESP32s to connect
-    RULE_RACE       = auto()   # choose race-to (11 or 21)
-    RULE_BO         = auto()   # choose best-of (3 or 5)
-    CONFIRM_RULES   = auto()   # both players confirm rules
-    SERVING_CHOICE  = auto()   # first press picks who serves
-    PLAYING         = auto()   # active scoring
-    WIN_CONFIRM     = auto()   # game over – next game or extend-to-5 prompt
+    RULE_RACE       = auto()   # green=race-to-11, blue=race-to-21
+    RULE_BO         = auto()   # green=best-of-3,  blue=best-of-5
+    CONFIRM_RULES   = auto()   # either player taps to confirm
+    SERVING_CHOICE  = auto()   # first tap picks the server
+    PLAYING         = auto()   # live scoring
+    WIN_CONFIRM     = auto()   # end-of-game; both tap to continue
     MATCH_OVER      = auto()   # match finished
 
+
 # =============================================================================
-#  GAME STATE  (everything we need to snapshot for undo)
+#  GAME STATE
 # =============================================================================
 
 class GameState:
     """
-    Immutable-ish snapshot of the entire match.
-    We deep-copy this onto the undo stack before every mutation.
+    Complete snapshot of the match.  Deep-copied before every mutation so
+    double-press can restore any prior state instantly.
 
-    SCORE MODEL — POSITIONAL, NOT BY COLOUR
-    ----------------------------------------
-    Scores and game-win counts are stored by *side* (left / right), not by
-    button colour (green / blue).  This is the key design decision that makes
-    the side-swap logic correct:
+    POSITIONAL SCORE MODEL
+    ----------------------
+    score["left"] and score["right"] track points for whoever is physically
+    on that side RIGHT NOW.  games_won is also positional.
 
-        Green is ALWAYS the left button.
-        Blue  is ALWAYS the right button.
+    When players swap ends between games, games_won is flipped so the
+    left/right columns stay accurate.  This is what makes:
+      - Andrew wins game 1 on the left  -> games_won = {left:1, right:0}
+      - After swapping                  -> games_won = {left:0, right:1}
+    work correctly without tracking player identities.
 
-    When players physically swap ends between games, the person who was on
-    the left moves to the right and vice versa.  From the scoreboard's point
-    of view the LEFT column still belongs to whoever is standing on the left —
-    which is now the person who was previously on the right.
+    Green button = always LEFT side.
+    Blue  button = always RIGHT side.
 
-    Concretely: if Andrew starts on the left (green) and wins game 1, the
-    scoreboard shows  Games 1–0.  After swapping, Andrew is on the right
-    (blue), so game 2 starts as  Games 0–1  — the LEFT column has reset to 0
-    because the left side is now Bill, who has 0 game wins.
+    server = "left" | "right" (never a colour string).
 
-    Implementation:
-        self.score      = {"left": 0, "right": 0}   # points in current game
-        self.games_won  = {"left": 0, "right": 0}   # games won in match
-
-    Button colour → side mapping (fixed for the whole match):
-        green button  → always LEFT
-        blue button   → always RIGHT
-
-    "server" is stored as a side ("left" | "right") so it survives swaps
-    naturally — the server label stays with the physical side, not the player.
+    serve_num is a monotonically-increasing integer across the entire match.
+    It forms the first component of every pre-generated BMP filename, making
+    undo trivially simple: just restore the snapshot and the filename is known.
     """
 
     def __init__(self):
-        # ── Rules ──────────────────────────────────────────────────────────
-        self.race_to      = 11        # 11 or 21
-        self.best_of      = 3         # 3 or 5
+        self.race_to      = 11
+        self.best_of      = 3
 
-        # ── Match progress ─────────────────────────────────────────────────
-        # Stored by side (left/right).  Sides swap each game, so the numbers
-        # flip automatically — exactly what the spec requires.
         self.games_won    = {"left": 0, "right": 0}
-        self.current_game = 1         # 1-based game counter
+        self.current_game = 1
 
-        # ── Current game score (positional) ────────────────────────────────
         self.score        = {"left": 0, "right": 0}
 
-        # ── Serve ──────────────────────────────────────────────────────────
-        # server is "left" or "right" (the side, not the colour).
-        self.server       = "left"    # side of current server
-        self.serve_count  = 1         # 1 or 2 within this server's turn
+        self.server       = "left"   # "left" or "right"
+        self.serve_count  = 1        # 1 or 2 within current server's turn
+        self.serve_num    = 0        # global monotonic serve counter
 
-        # ── State machine ──────────────────────────────────────────────────
+        # Set to "gl{race_to}bo{best_of}.bmp" after rules are confirmed
+        self.base_image   = None
+
         self.state        = State.WAITING_BUTTONS
 
-        # ── Confirmation tracking (CONFIRM_RULES) ──────────────────────────
-        self.confirmed    = {"green": False, "blue": False}
+        self.extend_prompt = False
+        self.game_winner   = None    # "left" or "right"
 
-        # ── WIN_CONFIRM prompt ─────────────────────────────────────────────
-        # After best-of-3 we ask "extend to 5?". True = yes-question active.
-        self.extend_prompt  = False
-        self.game_winner    = None    # side ("left"|"right") of game winner
-
-        # ── History of game scores (for match summary) ──────────────────────
-        # list of {"left": l_score, "right": r_score, "winner": side}
-        self.game_history = []
-
-    # ── Colour → side helpers (green is always left, blue always right) ────
+        # list of {left, right, winner_side, winner_colour}
+        self.game_history  = []
 
     @staticmethod
     def colour_to_side(colour: str) -> str:
-        """Map button colour to physical side. Always green=left, blue=right."""
+        """Green is always left, blue is always right."""
         return "left" if colour == "green" else "right"
 
     @staticmethod
     def side_to_colour(side: str) -> str:
-        """Map physical side to button colour."""
         return "green" if side == "left" else "blue"
 
     def server_colour(self) -> str:
-        """Return the colour of the current server."""
         return self.side_to_colour(self.server)
 
     def server_side_label(self) -> str:
-        """Return 'Left' or 'Right' (capitalised) for the current server."""
         return self.server.capitalize()
 
     def clone(self):
@@ -211,72 +230,270 @@ class GameState:
 
 
 # =============================================================================
-#  LOGGER  (human-readable, spec-compliant format)
+#  COMPOSITOR  (ImageMagick wrapper)
+# =============================================================================
+
+class Compositor:
+    """
+    Composites pre-made BMP layers using ImageMagick.
+
+    All score images are built from exactly these four layers:
+      1. Base image     (rules-specific background)
+      2. Serve overlay  (serveleft.bmp or serveright.bmp at fixed position)
+      3. Left digit     (N.bmp at x=LEFT_SCORE_X, y=LEFT_SCORE_Y)
+      4. Right digit    (N.bmp at x=RIGHT_SCORE_X, y=RIGHT_SCORE_Y)
+
+    ImageMagick composite syntax used:
+      convert base.bmp
+              overlay.bmp -geometry +Ox+Oy -composite
+              left.bmp    -geometry +Lx+Ly -composite
+              right.bmp   -geometry +Rx+Ry -composite
+              out.bmp
+    """
+
+    @staticmethod
+    def run(args: list, outfile: str) -> bool:
+        """Run: convert <args...> <outfile>"""
+        cmd = ["convert"] + args + [outfile]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=15)
+            if r.returncode != 0:
+                logging.warning(f"[IM] {r.stderr.decode().strip()}")
+                return False
+            return True
+        except Exception as e:
+            logging.error(f"[IM] exception: {e}")
+            return False
+
+    @staticmethod
+    def build_score(
+        base_img: str,
+        serve_overlay: str, serve_x: int, serve_y: int,
+        left_score: int, right_score: int,
+        outfile: str,
+    ) -> bool:
+        """
+        Composite one complete score BMP from four pre-made layers.
+        Returns True on success.
+        """
+        left_digit  = digit_path(left_score)
+        right_digit = digit_path(right_score)
+
+        for p in (base_img, serve_overlay, left_digit, right_digit):
+            if not os.path.exists(p):
+                logging.error(f"[Compositor] Missing asset: {p}")
+                return False
+
+        args = [
+            base_img,
+            serve_overlay,
+            "-geometry", f"+{serve_x}+{serve_y}", "-composite",
+            left_digit,
+            "-geometry", f"+{LEFT_SCORE_X}+{LEFT_SCORE_Y}", "-composite",
+            right_digit,
+            "-geometry", f"+{RIGHT_SCORE_X}+{RIGHT_SCORE_Y}", "-composite",
+        ]
+        return Compositor.run(args, outfile)
+
+
+# =============================================================================
+#  DISPLAY MANAGER
+# =============================================================================
+
+class DisplayManager:
+    """
+    Handles:
+      - Sending any BMP to the e-paper
+      - Building composite score images on demand
+      - Pre-generating the next two score images in a background thread
+
+    PRE-GENERATION CONTRACT
+    -----------------------
+    Before returning from any score event, DisplayManager.pregenerate(gs)
+    is called.  It reads serve_num, left score, and right score from gs
+    (the state AFTER the point was awarded and serve advanced) and builds:
+
+        /tmp/<serve_num:02d>.<left+1>-<right>.bmp
+        /tmp/<serve_num:02d>.<left>-<right+1>.bmp
+
+    These are the two images that will be needed when the next button is
+    pressed.  They use the NEW serve_num (post-advance) because that is
+    what will be in GameState when the next point is scored and we go to
+    look up the pre-generated file.
+
+    The lock ensures two back-to-back rapid presses don't corrupt each
+    other's file writes.
+    """
+
+    def __init__(self):
+        self._pregen_lock = threading.Lock()
+
+    # ── E-paper output ────────────────────────────────────────────────────
+
+    def show_file(self, path: str):
+        """Send a BMP file to the IT8951 e-paper display."""
+        if not os.path.exists(path):
+            logging.error(f"[Display] File not found: {path}")
+            return
+        logging.info(f"[Display] -> {path}")
+        try:
+            subprocess.Popen(
+                [EPAPER_CMD, "0", "0", path],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as e:
+            logging.error(f"[Display] IT8951 failed: {e}")
+
+    def show_asset(self, filename: str):
+        """Send a file from ASSETS to the display."""
+        self.show_file(asset(filename))
+
+    # ── Score image building ──────────────────────────────────────────────
+
+    def _overlay_for(self, server: str) -> tuple:
+        """Return (overlay_path, x, y) for the given server side string."""
+        if server == "left":
+            return asset("serveleft.bmp"), SERVE_LEFT_X, SERVE_LEFT_Y
+        else:
+            return asset("serveright.bmp"), SERVE_RIGHT_X, SERVE_RIGHT_Y
+
+    def build_score_image(
+        self,
+        gs: GameState,
+        left_score: int,
+        right_score: int,
+        serve_num: int,
+    ) -> str:
+        """
+        Composite and write one score BMP.
+        Returns the output path (whether freshly built or already existing).
+        """
+        outfile = tmp_score_path(serve_num, left_score, right_score)
+        if os.path.exists(outfile):
+            return outfile
+
+        overlay, sx, sy = self._overlay_for(gs.server)
+        base = asset(gs.base_image)
+
+        Compositor.build_score(
+            base_img      = base,
+            serve_overlay = overlay,
+            serve_x       = sx,
+            serve_y       = sy,
+            left_score    = left_score,
+            right_score   = right_score,
+            outfile       = outfile,
+        )
+        return outfile
+
+    def show_score(self, gs: GameState):
+        """
+        Show the score image for the current GameState.
+        Builds it synchronously if not already on disk.
+        """
+        path = tmp_score_path(gs.serve_num, gs.score["left"], gs.score["right"])
+        if not os.path.exists(path):
+            self.build_score_image(gs, gs.score["left"], gs.score["right"], gs.serve_num)
+        self.show_file(path)
+
+    # ── Pre-generation ────────────────────────────────────────────────────
+
+    def pregenerate(self, gs: GameState):
+        """
+        Spawn a daemon thread to pre-build the two next score images.
+
+        We pre-generate based on the CURRENT serve_num (after the last
+        advance).  If either player scores on the current serve, the
+        resulting image filename will be:
+            /tmp/<current_serve_num:02d>.<l+1>-<r>.bmp
+            /tmp/<current_serve_num:02d>.<l>-<r+1>.bmp
+        """
+        gs_snap = gs.clone()   # immune to further main-thread mutations
+
+        def _work():
+            with self._pregen_lock:
+                sn = gs_snap.serve_num
+                l  = gs_snap.score["left"]
+                r  = gs_snap.score["right"]
+                overlay, sx, sy = self._overlay_for(gs_snap.server)
+                base = asset(gs_snap.base_image)
+
+                # Image if left scores next
+                p_l = tmp_score_path(sn, l + 1, r)
+                if not os.path.exists(p_l):
+                    Compositor.build_score(
+                        base_img=base, serve_overlay=overlay,
+                        serve_x=sx, serve_y=sy,
+                        left_score=l + 1, right_score=r,
+                        outfile=p_l,
+                    )
+                    logging.debug(f"[Pregen] {p_l}")
+
+                # Image if right scores next
+                p_r = tmp_score_path(sn, l, r + 1)
+                if not os.path.exists(p_r):
+                    Compositor.build_score(
+                        base_img=base, serve_overlay=overlay,
+                        serve_x=sx, serve_y=sy,
+                        left_score=l, right_score=r + 1,
+                        outfile=p_r,
+                    )
+                    logging.debug(f"[Pregen] {p_r}")
+
+        threading.Thread(target=_work, daemon=True).start()
+
+
+# =============================================================================
+#  LOGGER
 # =============================================================================
 
 class MatchLogger:
     """
-    Writes to logs/<epoch>.txt using the exact format specified:
+    Writes logs/<epoch>.txt in the exact format specified.
 
-        <blank line>
-        Green/Left serving (1)
-        <timestamp> - <colour> button pressed. <description>. <score>
-        <blank line>   OR   Change of serve\n<blank line>
-        Green/Left serving (2)
-        ...
+    Serve header format:  Green/Left serving (1)
+    Point log format:     Mon  2 Mar 21:40:10 PST 2026 - Green button pressed. Green scores. 1-0
+    Change of serve:      Change of serve   (then blank line)
+    Undo format:          Mon  2 Mar 21:41:00 PST 2026 - Blue double pressed. Score reverted. 3-2
     """
 
     def __init__(self):
         os.makedirs(LOG_DIR, exist_ok=True)
-        epoch = int(time.time())
-        path  = os.path.join(LOG_DIR, f"{epoch}.txt")
-        self._fh   = open(path, "w", buffering=1)  # line-buffered
-        self._path = path
-        # Also mirror to console via Python logging
+        epoch    = int(time.time())
+        path     = os.path.join(LOG_DIR, f"{epoch}.txt")
+        self._fh = open(path, "w", buffering=1)   # line-buffered for safety
         logging.basicConfig(
             level=logging.DEBUG,
-            format="%(asctime)s [%(levelname)s] %(message)s"
+            format="%(asctime)s [%(levelname)s] %(message)s",
         )
         self._log = logging.getLogger("pingpong")
         self._log.info(f"Log file: {path}")
 
-    def _ts(self):
-        """Return human-readable timestamp matching spec: Mon  2 Mar 21:37:34 PST 2026"""
-        # We use local time; 'PST' is hard-coded – replace with your zone if needed
+    def _ts(self) -> str:
         now = datetime.now()
-        # day with leading space if single digit (spec shows " 2" not "02")
-        day = now.strftime("%-d")          # Linux: no zero-pad
-        day_padded = day.rjust(2)          # right-justify in 2 chars = " 2"
-        ts  = now.strftime(f"%a {day_padded} %b %H:%M:%S PST %Y")
-        return ts
+        day = now.strftime("%-d").rjust(2)   # " 2" not "02"
+        return now.strftime(f"%a {day} %b %H:%M:%S PST %Y")
 
-    def write(self, text, newline=True):
-        """Raw write to log file."""
-        self._fh.write(text + ("\n" if newline else ""))
+    def write(self, text: str):
+        self._fh.write(text + "\n")
         self._fh.flush()
 
     def blank(self):
         self.write("")
 
-    def event(self, msg):
-        """Timestamped event line."""
+    def event(self, msg: str):
         line = f"{self._ts()} - {msg}"
         self.write(line)
         self._log.info(line)
 
     def serve_header(self, gs: GameState):
-        """
-        Emit:   Green/Left serving (1)
-        Called immediately after any serve change or game start.
-        server is stored as a side ("left"/"right"); colour is derived.
-        """
         colour = gs.server_colour().capitalize()   # "Green" or "Blue"
         side   = gs.server_side_label()            # "Left"  or "Right"
-        n      = gs.serve_count
-        self.write(f"{colour}/{side} serving ({n})")
+        self.write(f"{colour}/{side} serving ({gs.serve_count})")
 
     def serve_change(self):
-        """Emit 'Change of serve' then blank line."""
+        """Emit 'Change of serve' followed by a blank line."""
         self.write("Change of serve")
         self.blank()
 
@@ -285,276 +502,31 @@ class MatchLogger:
 
 
 # =============================================================================
-#  IMAGE GENERATION  (ImageMagick → BMP → IT8951)
-# =============================================================================
-
-class DisplayManager:
-    """
-    Generates BMP images with ImageMagick and pushes them to the e-paper.
-
-    Pre-generation: after every state change we call pregenerate() which
-    renders all likely *next* screens into named files in IMAGE_DIR.
-    When a button is pressed we already have the file ready – we just call
-    show(filename).
-
-    Hand-drawn artwork override: if a file named
-        IMAGE_DIR/override/<key>.bmp
-    exists it is used instead of the generated version.  'key' is the same
-    string used as the pre-generated filename stem.
-    """
-
-    def __init__(self):
-        os.makedirs(IMAGE_DIR, exist_ok=True)
-        os.makedirs(os.path.join(IMAGE_DIR, "override"), exist_ok=True)
-        self._current_file = None
-        self._pregen_thread = None
-        self._pregen_lock   = threading.Lock()
-
-    # ── Low-level rendering ───────────────────────────────────────────────
-
-    def _run_imagemagick(self, args: list, outfile: str) -> bool:
-        """Run an ImageMagick convert command. Returns True on success."""
-        cmd = ["convert"] + args + [outfile]
-        try:
-            result = subprocess.run(cmd, capture_output=True, timeout=10)
-            if result.returncode != 0:
-                logging.warning(f"ImageMagick error: {result.stderr.decode()}")
-                return False
-            return True
-        except Exception as e:
-            logging.error(f"ImageMagick exception: {e}")
-            return False
-
-    def _make_score_bmp(
-        self,
-        left_score: int, right_score: int,
-        left_label: str, right_label: str,
-        server_side: str,           # "left" or "right"
-        serve_count: int,
-        game_num: int,
-        games_left: int, games_right: int,
-        outfile: str
-    ):
-        """
-        Generate the main in-game score screen.
-
-        Layout (800×600):
-          Row 1 (top):   left player label          right player label
-          Row 2 (mid):   BIG left score   •   BIG right score
-          Row 3 (bot):   serve indicator     game counter
-        """
-        w, h = DISPLAY_WIDTH, DISPLAY_HEIGHT
-
-        # Serve indicator: underline the serving side label
-        # We draw a circle/dot under the server's score
-        serve_x = 200 if server_side == "left" else 600
-        serve_mark = f"-fill black -draw 'circle {serve_x},420 {serve_x+18},420'"
-
-        # Annotate: left label
-        args = [
-            "-size", f"{w}x{h}",
-            f"xc:{IM_BG}",
-            "-font", IM_FONT,
-            "-fill", IM_FG,
-            # Left player label
-            "-pointsize", str(LABEL_FONT_SIZE),
-            "-gravity", "NorthWest",
-            "-annotate", "+40+30", left_label,
-            # Right player label
-            "-gravity", "NorthEast",
-            "-annotate", "+40+30", right_label,
-            # Left score
-            "-pointsize", str(SCORE_FONT_SIZE),
-            "-gravity", "West",
-            "-annotate", "+60-40", str(left_score),
-            # Right score
-            "-gravity", "East",
-            "-annotate", "+60-40", str(right_score),
-            # Centre divider dash
-            "-pointsize", str(SCORE_FONT_SIZE),
-            "-gravity", "Center",
-            "-annotate", "+0-40", "—",
-            # Game score (top centre)
-            "-pointsize", str(STATUS_FONT_SIZE),
-            "-gravity", "North",
-            "-annotate", f"+0+{LABEL_FONT_SIZE+10}",
-            f"Game {game_num}   ({games_left} — {games_right})",
-            # Serve indicator label (bottom)
-            "-pointsize", str(STATUS_FONT_SIZE),
-            "-gravity", "South",
-            "-annotate", "+0+30",
-            f"{'▶' if server_side=='left' else '   '}  Serving  {'◀' if server_side=='right' else '   '} ({serve_count})",
-        ]
-        self._run_imagemagick(args, outfile)
-
-    def _make_text_bmp(self, lines: list, outfile: str, font_size: int = 48):
-        """
-        Simple full-screen text BMP for menus/status screens.
-        lines: list of strings, centre-aligned vertically & horizontally.
-        """
-        w, h = DISPLAY_WIDTH, DISPLAY_HEIGHT
-        # Build multiline label
-        text = "\n".join(lines)
-        args = [
-            "-size", f"{w}x{h}",
-            f"xc:{IM_BG}",
-            "-font", IM_FONT,
-            "-fill", IM_FG,
-            "-pointsize", str(font_size),
-            "-gravity", "Center",
-            "-annotate", "+0+0", text,
-        ]
-        self._run_imagemagick(args, outfile)
-
-    # ── Override hook ─────────────────────────────────────────────────────
-
-    def _resolve(self, key: str) -> str:
-        """
-        Return override path if it exists, otherwise generated path.
-        key is a short identifier like 'score_5_3_L1' or 'menu_race'.
-        """
-        override = os.path.join(IMAGE_DIR, "override", f"{key}.bmp")
-        if os.path.exists(override):
-            return override
-        return os.path.join(IMAGE_DIR, f"{key}.bmp")
-
-    # ── Public: show a screen ─────────────────────────────────────────────
-
-    def show(self, key: str):
-        """Display the BMP identified by key on the e-paper."""
-        path = self._resolve(key)
-        if not os.path.exists(path):
-            logging.warning(f"[Display] BMP not found for key '{key}', regenerating…")
-            return   # caller should have pre-generated; log and skip
-        self._current_file = path
-        try:
-            subprocess.Popen(
-                [EPAPER_CMD, "0", "0", path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-        except Exception as e:
-            logging.error(f"[Display] IT8951 command failed: {e}")
-
-    def show_file(self, path: str):
-        """Show an arbitrary BMP file path directly."""
-        self._current_file = path
-        try:
-            subprocess.Popen(
-                [EPAPER_CMD, "0", "0", path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-        except Exception as e:
-            logging.error(f"[Display] IT8951 command failed: {e}")
-
-    # ── Key builders ──────────────────────────────────────────────────────
-
-    @staticmethod
-    def score_key(gs: GameState) -> str:
-        """
-        Canonical key for a score screen — fully positional.
-        e.g.  score_L3_R7_svL_s2_gm2_gl1_rg0
-        (L=left points, R=right points, sv=serving side, s=serve number,
-         gm=game number, gl=games won by left, rg=games won by right)
-        """
-        return (
-            f"score_L{gs.score['left']}_R{gs.score['right']}"
-            f"_sv{gs.server}_s{gs.serve_count}"
-            f"_gm{gs.current_game}"
-            f"_gl{gs.games_won['left']}_rg{gs.games_won['right']}"
-        )
-
-    # ── Pre-generation helpers ────────────────────────────────────────────
-
-    def _gen_score_screen(self, gs: GameState, key: str):
-        """Render a score BMP for the given game state."""
-        outfile = os.path.join(IMAGE_DIR, f"{key}.bmp")
-        if os.path.exists(self._resolve(key)):
-            return   # already exists or override present
-        self._make_score_bmp(
-            left_score   = gs.score["left"],
-            right_score  = gs.score["right"],
-            left_label   = "Green",   # green is always left button
-            right_label  = "Blue",    # blue  is always right button
-            server_side  = gs.server,
-            serve_count  = gs.serve_count,
-            game_num     = gs.current_game,
-            games_left   = gs.games_won["left"],
-            games_right  = gs.games_won["right"],
-            outfile      = outfile
-        )
-
-    def pregenerate_score_screens(self, gs: GameState):
-        """
-        After any score change, immediately render the three most likely
-        next screens in a background thread so they are ready instantly:
-          1. Current state (already displayed, but regenerate if missing)
-          2. Left side scores next  (green button pressed)
-          3. Right side scores next (blue button pressed)
-        All simulation is purely positional (left/right).
-        """
-        def _work():
-            with self._pregen_lock:
-                # Current
-                self._gen_score_screen(gs, self.score_key(gs))
-
-                # Left side scores next
-                gs_l = gs.clone()
-                _apply_point(gs_l, "left")
-                self._gen_score_screen(gs_l, self.score_key(gs_l))
-
-                # Right side scores next
-                gs_r = gs.clone()
-                _apply_point(gs_r, "right")
-                self._gen_score_screen(gs_r, self.score_key(gs_r))
-
-        t = threading.Thread(target=_work, daemon=True)
-        t.start()
-
-    def generate_menu(self, key: str, lines: list, font_size: int = 56):
-        """Render a menu/status text screen (blocking – called before show)."""
-        outfile = os.path.join(IMAGE_DIR, f"{key}.bmp")
-        if not os.path.exists(self._resolve(key)):
-            self._make_text_bmp(lines, outfile, font_size)
-
-    def generate_and_show_menu(self, key: str, lines: list, font_size: int = 56):
-        """Render + display a text menu screen."""
-        self.generate_menu(key, lines, font_size)
-        self.show(key)
-
-
-# =============================================================================
-#  PURE GAME LOGIC  (stateless helpers – operate on GameState clones)
-#
-#  All functions work in terms of "left" and "right" sides.
-#  Button colour → side translation happens only at the engine boundary
-#  (handle_button / _handle_score) via GameState.colour_to_side().
+#  PURE GAME LOGIC
 # =============================================================================
 
 def _advance_serve(gs: GameState) -> bool:
     """
-    Advance the serve counter.  2 serves per side always, even at deuce.
-    Modifies gs in-place.
-    Returns True if there was a change of server (i.e. server rotated).
+    Move to the next serve within the rotation.
+
+    serve_num increments on every serve (1st and 2nd).
+    serve_count cycles 1 -> 2 -> (rotate server) -> 1.
+    Returns True if the server changed.
     """
+    gs.serve_num += 1
     if gs.serve_count == 1:
         gs.serve_count = 2
-        return False   # same server, second serve
+        return False          # same server, second serve
     else:
-        # Rotate to the other side
         gs.serve_count = 1
         gs.server = "right" if gs.server == "left" else "left"
-        return True    # server changed
+        return True           # server rotated
 
 
 def _apply_point(gs: GameState, side: str) -> bool:
     """
-    Award a point to the given side ("left" or "right").
-    Advance serve counter.
-    Does NOT check for game win – use check_game_win() after calling this.
-    Modifies gs in-place.
-    Returns True if there was a change of server.
+    Award a point to side ("left" or "right") and advance the serve.
+    Returns True if the server changed.
     """
     gs.score[side] += 1
     return _advance_serve(gs)
@@ -562,26 +534,19 @@ def _apply_point(gs: GameState, side: str) -> bool:
 
 def check_game_win(gs: GameState):
     """
-    Return the winning side ("left" | "right") if the current game is over,
-    else None.
-    Win condition: score >= race_to AND lead >= 2 (win-by-two rule).
+    Return "left", "right", or None.
+    Win condition: score >= race_to AND lead >= 2 (win-by-two).
     """
-    l = gs.score["left"]
-    r = gs.score["right"]
-    if l >= gs.race_to or r >= gs.race_to:
-        if abs(l - r) >= 2:
-            return "left" if l > r else "right"
+    l, r = gs.score["left"], gs.score["right"]
+    if (l >= gs.race_to or r >= gs.race_to) and abs(l - r) >= 2:
+        return "left" if l > r else "right"
     return None
 
 
 def swap_games_won(gs: GameState):
     """
-    When players physically change ends between games, the left/right
-    game-win counts must also swap so they stay positional.
-
-    Example: Andrew won game 1 while on the left → games_won = {left:1, right:0}.
-    After swapping ends, Andrew is on the right, so the same fact is now
-    expressed as games_won = {left:0, right:1}.
+    Flip the positional games_won dict to match the new physical positions
+    after players swap ends.
     """
     gs.games_won["left"], gs.games_won["right"] = (
         gs.games_won["right"],
@@ -591,34 +556,26 @@ def swap_games_won(gs: GameState):
 
 def start_new_game(gs: GameState, winning_side: str):
     """
-    Prepare for the next game:
-      1. Record the winning side BEFORE swapping (caller already appended history).
-      2. Swap games_won so they remain positional after the side change.
-      3. Reset per-game points to 0–0.
-      4. Increment game counter.
-      5. Set winning_side as the server for the new game.
-         (winning_side is passed in BEFORE the swap, so after the swap the
-          winner is on the opposite side — we flip it here.)
+    Prepare the next game.
 
-    The serve is awarded to the player who won the previous game, regardless
-    of which side they are now on.  Because winning_side was their side
-    BEFORE the swap, after the swap they are on the other side.
+    winning_side is the side BEFORE the end-of-game side-swap.
+    After the swap the winner is on the opposite side, so we set server
+    to that opposite side (winner serves first in the new game).
+
+    serve_num is NOT reset — it continues incrementing across games.
     """
-    # After the swap, the winner is on the opposite side to winning_side.
     new_server = "right" if winning_side == "left" else "left"
-
-    swap_games_won(gs)          # flip games_won to match new positions
+    swap_games_won(gs)
     gs.score        = {"left": 0, "right": 0}
     gs.current_game += 1
     gs.server       = new_server
     gs.serve_count  = 1
+    # serve_num keeps going; _advance_serve will increment it when the
+    # first serve of the new game is recognised.
 
 
 def match_winner(gs: GameState):
-    """
-    Return the winning side ("left" | "right") if the match is decided,
-    else None.  Uses current positional games_won.
-    """
+    """Return "left", "right", or None."""
     needed = (gs.best_of // 2) + 1   # 2 for BO3, 3 for BO5
     for side in ("left", "right"):
         if gs.games_won[side] >= needed:
@@ -626,183 +583,202 @@ def match_winner(gs: GameState):
     return None
 
 
+def base_image_name(race_to: int, best_of: int) -> str:
+    """e.g. race_to=11, best_of=3  ->  "gl11bo3.bmp" """
+    return f"gl{race_to}bo{best_of}.bmp"
+
+
 # =============================================================================
-#  MATCH ENGINE  (the main controller)
+#  MATCH ENGINE
 # =============================================================================
 
 class MatchEngine:
     """
-    Central controller that:
-      - Owns the GameState and undo stack
-      - Processes button events
-      - Drives the display
-      - Writes the log
+    Central controller:
+      - Owns GameState and the undo stack
+      - Dispatches button events to the correct handler
+      - Calls DisplayManager and MatchLogger for all side-effects
+
+    The critical timing flow for every scored point:
+      1. Look up the pre-generated image file (serve_num BEFORE advance)
+      2. Show it to the display immediately (near-instant)
+      3. Apply the point to GameState (score++ and serve advance)
+      4. Kick off pre-generation of the next two images (background thread)
     """
 
     def __init__(self, display: DisplayManager, logger: MatchLogger):
-        self.display    = display
-        self.logger     = logger
-        self.gs         = GameState()
-        self._undo_stack: list[GameState] = []   # stack of snapshots
+        self.display = display
+        self.logger  = logger
+        self.gs      = GameState()
 
-        # Track connected buttons for WAITING_BUTTONS state
-        self._connected  = {"green": False, "blue": False}
-
-        # Queue for incoming button events (thread-safe)
-        self.event_queue = queue.Queue()
-
-        # For WIN_CONFIRM: track who confirmed
-        self._win_confirmed = {"green": False, "blue": False}
-
-        # For CONFIRM_RULES: track who confirmed
-        self._rules_confirmed = {"green": False, "blue": False}
+        self._undo_stack: list[GameState] = []
+        self._connected       = {"green": False, "blue": False}
+        self.event_queue      = queue.Queue()
+        self._win_confirmed   = {"green": False, "blue": False}
 
     # ── Undo stack ────────────────────────────────────────────────────────
 
     def _push_undo(self):
-        """Save current state before a mutation."""
         self._undo_stack.append(self.gs.clone())
 
-    def _pop_undo(self):
-        """Restore previous state. Returns True if successful."""
+    def _pop_undo(self) -> bool:
         if self._undo_stack:
             self.gs = self._undo_stack.pop()
             return True
         return False
 
-    # ── Event entry points ────────────────────────────────────────────────
+    # ── Top-level button dispatcher ───────────────────────────────────────
 
     def handle_button(self, colour: str, press_type: str):
-        """
-        Main dispatcher.  Called from the MQTT thread (via queue) or
-        directly from the simulation thread.
-
-        colour:     "green" | "blue"
-        press_type: "short" | "double" | "long"
-        """
-        gs = self.gs   # convenience alias
-
-        # ── LONG PRESS: always resets the entire match ─────────────────────
         if press_type == "long":
-            self.logger.event(f"{colour.capitalize()} long press. Resetting entire match.")
+            self.logger.event(f"{colour.capitalize()} long press — full reset.")
             self._full_reset()
-            return
-
-        # ── DOUBLE PRESS: undo last action ─────────────────────────────────
-        if press_type == "double":
+        elif press_type == "double":
             self._handle_undo(colour)
-            return
-
-        # ── SHORT PRESS dispatched by state ────────────────────────────────
-        if press_type == "short":
+        elif press_type == "short":
             self._handle_short(colour)
 
+    # ── Short press dispatcher ────────────────────────────────────────────
+
     def _handle_short(self, colour: str):
-        gs = self.gs
+        gs    = self.gs
         state = gs.state
 
         if state == State.WAITING_BUTTONS:
-            # Buttons not used here; connection events drive this state
-            pass
+            pass   # only connection events advance this state
 
+        # ── RULE_RACE ──────────────────────────────────────────────────────
+        # gamelen.bmp is on screen. Green = 11, Blue = 21.
         elif state == State.RULE_RACE:
             self._push_undo()
-            if colour == "green":
-                gs.race_to = 11
-                self.logger.event(f"Green button pressed - Setting game mode to Race to 11")
-            else:
-                gs.race_to = 21
-                self.logger.event(f"Blue button pressed - Setting game mode to Race to 21")
+            gs.race_to = 11 if colour == "green" else 21
+            self.logger.event(
+                f"{colour.capitalize()} pressed – Race to {gs.race_to}"
+            )
             gs.state = State.RULE_BO
-            self._show_rule_bo()
+            # Show intermediate screen that asks best-of 3 or 5
+            self.display.show_asset(f"gl{gs.race_to}.bmp")
 
+        # ── RULE_BO ────────────────────────────────────────────────────────
+        # gl11.bmp or gl21.bmp is on screen. Green = 3, Blue = 5.
         elif state == State.RULE_BO:
             self._push_undo()
-            if colour == "green":
-                gs.best_of = 3
-                self.logger.event(f"Green button pressed - Setting match to best of 3")
-            else:
-                gs.best_of = 5
-                self.logger.event(f"Blue button pressed - Setting match to best of 5")
-            gs.state = State.CONFIRM_RULES
-            self._rules_confirmed = {"green": False, "blue": False}
-            self._show_confirm_rules()
-
-        elif state == State.CONFIRM_RULES:
-            self._rules_confirmed[colour] = True
+            gs.best_of = 3 if colour == "green" else 5
             self.logger.event(
-                f"{colour.capitalize()} button pressed - Confirmed rules "
-                f"({'both' if all(self._rules_confirmed.values()) else 'waiting for other player'})"
+                f"{colour.capitalize()} pressed – Best of {gs.best_of}"
             )
-            if all(self._rules_confirmed.values()):
-                self._push_undo()
-                gs.state = State.SERVING_CHOICE
-                self._show_serving_choice()
+            gs.state = State.CONFIRM_RULES
+            conf = f"gl{gs.race_to}bo{gs.best_of}conf.bmp"
+            self.display.show_asset(conf)
+            self.logger.event(f"Confirmation screen: {conf}")
 
+        # ── CONFIRM_RULES ──────────────────────────────────────────────────
+        # Confirmation screen on display. ONE tap from either player confirms.
+        elif state == State.CONFIRM_RULES:
+            self._push_undo()
+            gs.base_image = base_image_name(gs.race_to, gs.best_of)
+            self.logger.event(
+                f"{colour.capitalize()} pressed – Rules confirmed: "
+                f"race to {gs.race_to}, best of {gs.best_of}. "
+                f"Base image: {gs.base_image}"
+            )
+            gs.state = State.SERVING_CHOICE
+            self.display.show_asset("serve.bmp")
+            self.logger.write(
+                "Waiting for next button press to determine who serves first"
+            )
+
+        # ── SERVING_CHOICE ─────────────────────────────────────────────────
+        # serve.bmp on screen. First tap = first server.
         elif state == State.SERVING_CHOICE:
             self._push_undo()
-            # Translate the button colour to a side — green=left, blue=right.
-            # That side becomes the first server.
-            side = GameState.colour_to_side(colour)
+            side           = GameState.colour_to_side(colour)
             gs.server      = side
             gs.serve_count = 1
+            gs.serve_num   = 1   # first serve of the match
             gs.state       = State.PLAYING
+
             self.logger.event(
-                f"{colour.capitalize()} button pressed. "
-                f"{colour.capitalize()} on {side.capitalize()} serves first."
+                f"{colour.capitalize()} pressed – "
+                f"{colour.capitalize()}/{side.capitalize()} serves first."
             )
             self.logger.blank()
             self.logger.serve_header(gs)
-            self._show_score()
-            self.display.pregenerate_score_screens(gs)
 
+            # Build and show the initial 0-0 image (must be synchronous —
+            # nothing is pre-generated yet at this moment).
+            self.display.build_score_image(gs, 0, 0, gs.serve_num)
+            self.display.show_score(gs)
+
+            # Pre-generate both first-point outcomes in background.
+            self.display.pregenerate(gs)
+
+        # ── PLAYING ────────────────────────────────────────────────────────
         elif state == State.PLAYING:
             self._handle_score(colour)
 
+        # ── WIN_CONFIRM ────────────────────────────────────────────────────
         elif state == State.WIN_CONFIRM:
             self._handle_win_confirm(colour)
 
+        # ── MATCH_OVER ─────────────────────────────────────────────────────
         elif state == State.MATCH_OVER:
-            # Any press re-shows summary; long press resets (handled above)
             self._show_match_summary()
 
-    # ── Scoring ───────────────────────────────────────────────────────────
+    # ── Score a point ─────────────────────────────────────────────────────
 
     def _handle_score(self, colour: str):
         """
-        Award a point to the side that matches the pressed button colour.
-        Green button → left side.  Blue button → right side.
-        All score/games_won tracking is positional (left/right).
+        Flow (in order):
+          1. Determine the side (left/right) from the button colour.
+          2. Compute what the score WILL BE after this point.
+          3. Look up / show that pre-generated image immediately.
+          4. Push undo snapshot.
+          5. Apply the point (mutates GameState: score++, serve advances).
+          6. Log the point and serve rotation.
+          7. Check for game/match win.
+          8. Pre-generate next two images in background.
         """
-        gs = self.gs
-        self._push_undo()
-
-        # Translate button colour to the physical side it always occupies.
+        gs   = self.gs
         side = GameState.colour_to_side(colour)
 
+        # ── Step 2: compute future score ───────────────────────────────────
+        new_left  = gs.score["left"]  + (1 if side == "left"  else 0)
+        new_right = gs.score["right"] + (1 if side == "right" else 0)
+
+        # ── Step 3: show image immediately ─────────────────────────────────
+        # The serve_num used as the key is the CURRENT one (before _advance_serve
+        # increments it).  That is the same number we used when pre-generating
+        # this image after the PREVIOUS point.
+        img_path = tmp_score_path(gs.serve_num, new_left, new_right)
+        if not os.path.exists(img_path):
+            logging.warning(f"[Engine] Pre-generated image missing: {img_path} – building now")
+            self.display.build_score_image(gs, new_left, new_right, gs.serve_num)
+        self.display.show_file(img_path)
+
+        # ── Step 4: save undo snapshot ─────────────────────────────────────
+        self._push_undo()
+
+        # ── Step 5: mutate state ───────────────────────────────────────────
         changed_server = _apply_point(gs, side)
 
-        left_score  = gs.score["left"]
-        right_score = gs.score["right"]
-        score_str   = f"{left_score}-{right_score}"
-
-        # ── Log the point ──────────────────────────────────────────────────
+        # ── Step 6: log ────────────────────────────────────────────────────
+        score_str = f"{gs.score['left']}-{gs.score['right']}"
         self.logger.event(
             f"{colour.capitalize()} button pressed. "
             f"{colour.capitalize()} scores. {score_str}"
         )
 
-        # ── Check for game win ─────────────────────────────────────────────
+        # ── Step 7: check for game / match win ─────────────────────────────
         winning_side = check_game_win(gs)
         if winning_side:
-            # Record the final points score for this game BEFORE resetting.
+            winner_colour = GameState.side_to_colour(winning_side)
             gs.game_history.append({
-                "left":  gs.score["left"],
-                "right": gs.score["right"],
+                "left":          gs.score["left"],
+                "right":         gs.score["right"],
                 "winner_side":   winning_side,
-                "winner_colour": GameState.side_to_colour(winning_side),
+                "winner_colour": winner_colour,
             })
-            # Award the game win to the winning side (positional).
             gs.games_won[winning_side] += 1
             gs.game_winner = winning_side
 
@@ -811,49 +787,36 @@ class MatchEngine:
             else:
                 self.logger.blank()
 
-            winner_colour = GameState.side_to_colour(winning_side)
             self.logger.event(
-                f"{winner_colour.capitalize()} wins game {gs.current_game}! "
-                f"Games: {gs.games_won['left']}–{gs.games_won['right']} "
-                f"(left–right)"
+                f"{winner_colour.capitalize()} wins game {gs.current_game}!  "
+                f"Games: left {gs.games_won['left']} – {gs.games_won['right']} right"
             )
 
-            # Check for match win BEFORE calling start_new_game (which swaps).
             m_winner = match_winner(gs)
             if m_winner:
                 gs.state = State.MATCH_OVER
                 self._show_match_summary()
                 return
 
-            # Transition to WIN_CONFIRM
             gs.state = State.WIN_CONFIRM
             self._win_confirmed = {"green": False, "blue": False}
 
-            # After game 2 of a best-of-3 with scores 1–1: offer to extend.
-            total_games = gs.games_won["left"] + gs.games_won["right"]
-            if gs.best_of == 3 and total_games == 2:
+            total = gs.games_won["left"] + gs.games_won["right"]
+            if gs.best_of == 3 and total == 2:
                 gs.extend_prompt = True
                 self._show_extend_prompt()
             else:
                 self._show_win_confirm(winning_side)
             return
 
-        # ── Normal point: log serve info ───────────────────────────────────
+        # ── Step 8: normal point — log serve and pre-generate ──────────────
         if changed_server:
             self.logger.serve_change()
         else:
             self.logger.blank()
         self.logger.serve_header(gs)
 
-        # ── Update display ─────────────────────────────────────────────────
-        key = DisplayManager.score_key(gs)
-        target = self.display._resolve(key)
-        if not os.path.exists(target):
-            self.display._gen_score_screen(gs, key)
-        self.display.show(key)
-
-        # ── Pre-generate next likely screens ──────────────────────────────
-        self.display.pregenerate_score_screens(gs)
+        self.display.pregenerate(gs)
 
     # ── Win confirmation / game transition ────────────────────────────────
 
@@ -861,261 +824,167 @@ class MatchEngine:
         gs = self.gs
 
         if gs.extend_prompt:
-            # Green button (left) = YES extend to 5.
-            # Blue button (right) = NO, end match now.
+            # Green (left) = YES extend to best of 5
+            # Blue (right) = NO  end match
             if colour == "blue":
-                self.logger.event("Blue button pressed. Players chose NOT to extend to best of 5.")
+                self.logger.event("Blue pressed – not extending. Match over.")
                 gs.state = State.MATCH_OVER
                 self._show_match_summary()
             else:
-                self.logger.event("Green button pressed. Extending match to best of 5!")
+                self.logger.event("Green pressed – extending to best of 5!")
                 self._push_undo()
                 gs.best_of       = 5
                 gs.extend_prompt = False
-                winning_side     = gs.game_winner   # side that won the last game
-                start_new_game(gs, winning_side)    # swaps sides + games_won
+                gs.base_image    = base_image_name(gs.race_to, gs.best_of)
+                winning_side     = gs.game_winner
+                start_new_game(gs, winning_side)
                 gs.state = State.PLAYING
                 self.logger.blank()
                 self.logger.serve_header(gs)
-                self._show_score()
-                self.display.pregenerate_score_screens(gs)
+                self.display.build_score_image(gs, 0, 0, gs.serve_num)
+                self.display.show_score(gs)
+                self.display.pregenerate(gs)
             return
 
-        # Normal end-of-game: both players short-press to confirm.
+        # Both players tap to confirm and start next game
         self._win_confirmed[colour] = True
         both = all(self._win_confirmed.values())
         self.logger.event(
             f"{colour.capitalize()} confirmed. "
-            f"{'Both confirmed – starting next game.' if both else 'Waiting for other player.'}"
+            f"{'Both confirmed – next game.' if both else 'Waiting for other player.'}"
         )
         if both:
             self._push_undo()
             winning_side = gs.game_winner
-            start_new_game(gs, winning_side)   # swaps sides + games_won
+            start_new_game(gs, winning_side)
             gs.state = State.PLAYING
             self.logger.blank()
             self.logger.serve_header(gs)
-            self._show_score()
-            self.display.pregenerate_score_screens(gs)
+            self.display.build_score_image(gs, 0, 0, gs.serve_num)
+            self.display.show_score(gs)
+            self.display.pregenerate(gs)
 
     # ── Undo ──────────────────────────────────────────────────────────────
 
     def _handle_undo(self, colour: str):
-        """Undo the last action and restore the previous state."""
         if not self._undo_stack:
-            self.logger.event(f"{colour.capitalize()} double pressed. Nothing to undo.")
+            self.logger.event(f"{colour.capitalize()} double pressed – nothing to undo.")
             return
 
         self._pop_undo()
         gs = self.gs
 
-        # Score is positional — read directly from left/right.
         score_str = f"{gs.score['left']}-{gs.score['right']}"
-
         self.logger.event(
             f"{colour.capitalize()} double pressed. Score reverted. {score_str}"
         )
         self.logger.blank()
         self.logger.serve_header(gs)
 
-        # Refresh display for the restored state.
         if gs.state == State.PLAYING:
-            key = DisplayManager.score_key(gs)
-            target = self.display._resolve(key)
-            if not os.path.exists(target):
-                self.display._gen_score_screen(gs, key)
-            self.display.show(key)
-            self.display.pregenerate_score_screens(gs)
+            # The image for the restored state was pre-generated (or built
+            # synchronously) when we were in that state previously.
+            path = tmp_score_path(gs.serve_num, gs.score["left"], gs.score["right"])
+            if not os.path.exists(path):
+                self.display.build_score_image(
+                    gs, gs.score["left"], gs.score["right"], gs.serve_num
+                )
+            self.display.show_file(path)
+            self.display.pregenerate(gs)
         else:
-            self._redraw_current_state()
+            self._redraw_menu_state()
 
     # ── Full reset ────────────────────────────────────────────────────────
 
     def _full_reset(self):
-        """Reset everything back to RULE_RACE."""
         self.gs           = GameState()
         self._undo_stack  = []
         self._connected   = {"green": False, "blue": False}
         self.gs.state     = State.WAITING_BUTTONS
         self.logger.blank()
-        self.logger.event("=== FULL RESET – New match starting ===")
+        self.logger.event("=== FULL RESET ===")
         self.logger.blank()
-        self._show_waiting()
+        self._log_connection_status()
 
-    # ── Connection management ─────────────────────────────────────────────
+    # ── Connection ────────────────────────────────────────────────────────
 
     def on_button_connected(self, colour: str):
-        """Called when an ESP32 connects and sends its hello."""
         self._connected[colour] = True
         self.logger.event(f"{colour.capitalize()} button connected.")
-        self._show_waiting()
+        self._log_connection_status()
         if all(self._connected.values()):
-            self.logger.event("Both buttons connected. Starting rule selection.")
+            self.logger.event("Both buttons connected – showing rule selection.")
             self.gs.state = State.RULE_RACE
-            self._show_rule_race()
+            self.display.show_asset("gamelen.bmp")
 
-    # ── Display helpers ───────────────────────────────────────────────────
+    def _log_connection_status(self):
+        g = "connected" if self._connected["green"] else "waiting"
+        b = "connected" if self._connected["blue"]  else "waiting"
+        self.logger.event(f"Green: {g}  Blue: {b}")
 
-    def _show_waiting(self):
-        g = "✓ Connected" if self._connected["green"] else "✗ Waiting…"
-        b = "✓ Connected" if self._connected["blue"]  else "✗ Waiting…"
-        lines = [
-            "Ping-Pong Scorer",
-            "",
-            f"Green button:  {g}",
-            f"Blue button:   {b}",
-            "",
-            "Waiting for both buttons…"
-        ]
-        self.display.generate_and_show_menu("waiting_buttons", lines)
-
-    def _show_rule_race(self):
-        lines = [
-            "Select Race-To",
-            "",
-            "GREEN  =  Race to 11",
-            "",
-            "BLUE   =  Race to 21",
-        ]
-        self.display.generate_and_show_menu("menu_race", lines)
-        self.logger.event("Displaying race-to selection.")
-
-    def _show_rule_bo(self):
-        lines = [
-            f"Race to {self.gs.race_to} selected.",
-            "",
-            "Select Match Length",
-            "",
-            "GREEN  =  Best of 3",
-            "",
-            "BLUE   =  Best of 5",
-        ]
-        self.display.generate_and_show_menu("menu_bo", lines)
-        self.logger.event("Displaying best-of selection.")
-
-    def _show_confirm_rules(self):
-        gs = self.gs
-        lines = [
-            f"Rules: Race to {gs.race_to}  |  Best of {gs.best_of}",
-            "",
-            "Both players: press your button",
-            "to confirm.",
-        ]
-        self.display.generate_and_show_menu("confirm_rules", lines)
-        self.logger.event("Waiting for both players to confirm rules.")
-
-    def _show_serving_choice(self):
-        lines = [
-            "Who serves first?",
-            "",
-            "Press YOUR button to serve first.",
-            "",
-            "GREEN = left side",
-            "BLUE  = right side",
-        ]
-        self.display.generate_and_show_menu("serving_choice", lines)
-        self.logger.write("Waiting for next button press to determine who serves first")
-
-    def _show_score(self):
-        gs  = self.gs
-        key = DisplayManager.score_key(gs)
-        target = self.display._resolve(key)
-        if not os.path.exists(target):
-            self.display._gen_score_screen(gs, key)
-        self.display.show(key)
+    # ── Menu display helpers ───────────────────────────────────────────────
 
     def _show_win_confirm(self, winning_side: str):
-        gs = self.gs
-        winner_colour = GameState.side_to_colour(winning_side)
-        lines = [
-            f"Game {gs.current_game} over!",
-            "",
-            f"{winner_colour.capitalize()} ({winning_side}) wins!",
-            f"Games:  Left {gs.games_won['left']} – {gs.games_won['right']} Right",
-            "",
-            "Both players press to start next game.",
-        ]
-        key = f"win_confirm_g{gs.current_game}"
-        self.display.generate_and_show_menu(key, lines)
+        wc = GameState.side_to_colour(winning_side)
+        self.logger.event(
+            f"Game {self.gs.current_game} over – {wc.capitalize()} wins.  "
+            f"Games: left {self.gs.games_won['left']} – "
+            f"{self.gs.games_won['right']} right.  "
+            "Both tap to continue."
+        )
 
     def _show_extend_prompt(self):
-        gs = self.gs
-        lines = [
-            f"Games tied  {gs.games_won['left']}–{gs.games_won['right']}!",
-            "",
-            "Extend to Best of 5?",
-            "",
-            "GREEN (left) = YES   |   BLUE (right) = NO",
-        ]
-        self.display.generate_and_show_menu("extend_prompt", lines)
-        self.logger.event("Asking players if they want to extend to best of 5.")
+        self.logger.event(
+            "Games tied 1-1.  Green = extend to best of 5.  Blue = end match now."
+        )
 
     def _show_match_summary(self):
         gs = self.gs
-        w  = match_winner(gs)   # "left" or "right" side
-        w_colour = GameState.side_to_colour(w) if w else "unknown"
-        lines = ["=== MATCH OVER ===", ""]
-        for i, g in enumerate(gs.game_history, 1):
-            wc = g["winner_colour"].capitalize()
-            ws = g["winner_side"].capitalize()
-            lines.append(
-                f"Game {i}: Left {g['left']} – {g['right']} Right  "
-                f"({wc}/{ws} wins)"
-            )
-        lines += [
-            "",
-            f"Games:  Left {gs.games_won['left']} – {gs.games_won['right']} Right",
-            "",
-            f"WINNER: {w_colour.upper()} ({w.upper() if w else '???'} side)",
-            "",
-            "Long press either button to play again.",
-        ]
-        key = "match_summary"
-        self.display.generate_and_show_menu(key, lines, font_size=42)
+        w  = match_winner(gs)
+        wc = GameState.side_to_colour(w) if w else "unknown"
         self.logger.blank()
-        self.logger.event(f"=== MATCH OVER. Winner: {w_colour} ({w} side) ===")
+        self.logger.event(f"=== MATCH OVER – Winner: {wc.upper()} ===")
         for i, g in enumerate(gs.game_history, 1):
             self.logger.event(
-                f"  Game {i}: Left {g['left']} – {g['right']} Right "
+                f"  Game {i}: left {g['left']} – {g['right']} right "
                 f"({g['winner_colour']} wins)"
             )
+        self.logger.event(
+            f"  Final games tally: "
+            f"left {gs.games_won['left']} – {gs.games_won['right']} right"
+        )
+        self.logger.event("Long press either button to start a new match.")
 
-    def _redraw_current_state(self):
-        """Re-render whatever the current state demands after an undo."""
-        s = self.gs.state
+    def _redraw_menu_state(self):
+        """Re-show the correct asset after a menu-level undo."""
+        s  = self.gs.state
+        gs = self.gs
         if s == State.RULE_RACE:
-            self._show_rule_race()
+            self.display.show_asset("gamelen.bmp")
         elif s == State.RULE_BO:
-            self._show_rule_bo()
+            self.display.show_asset(f"gl{gs.race_to}.bmp")
         elif s == State.CONFIRM_RULES:
-            self._show_confirm_rules()
+            self.display.show_asset(f"gl{gs.race_to}bo{gs.best_of}conf.bmp")
         elif s == State.SERVING_CHOICE:
-            self._show_serving_choice()
-        elif s == State.PLAYING:
-            self._show_score()
+            self.display.show_asset("serve.bmp")
         elif s == State.WIN_CONFIRM:
-            if self.gs.extend_prompt:
+            if gs.extend_prompt:
                 self._show_extend_prompt()
             else:
-                self._show_win_confirm(self.gs.game_winner)
-        elif s == State.MATCH_OVER:
-            self._show_match_summary()
+                self._show_win_confirm(gs.game_winner)
 
-    # ── Main loop ─────────────────────────────────────────────────────────
+    # ── Main event loop ───────────────────────────────────────────────────
 
     def run(self):
-        """Process events from the queue forever."""
-        self.logger.event("New game started.")
-        self._show_waiting()
+        self.logger.event("Ping-pong scorer started. Waiting for buttons.")
         while True:
             try:
                 colour, press_type = self.event_queue.get(timeout=1)
                 self.handle_button(colour, press_type)
             except queue.Empty:
-                pass   # keepalive tick
+                pass   # idle tick — keeps the thread alive
             except Exception as e:
-                logging.exception(f"Error in event handler: {e}")
-                # Never crash; log and continue
+                logging.exception(f"[Engine] Unhandled error (continuing): {e}")
 
 
 # =============================================================================
@@ -1123,92 +992,72 @@ class MatchEngine:
 # =============================================================================
 
 class MQTTClient:
-    """
-    Wraps paho-mqtt with automatic reconnect.
-    Feeds events into the engine's queue.
-    Also listens on status/green and status/blue for connection announcements.
-    """
-
     def __init__(self, engine: MatchEngine):
-        self.engine = engine
+        self.engine  = engine
         self._client = None
-        self._connected_to_broker = False
 
     def start(self):
         if not MQTT_AVAILABLE:
-            logging.warning("paho-mqtt not available – MQTT client not started.")
+            logging.warning("paho-mqtt not available – MQTT disabled.")
             return
         self._client = mqtt.Client(client_id="pingpong_pi")
         self._client.on_connect    = self._on_connect
         self._client.on_disconnect = self._on_disconnect
         self._client.on_message    = self._on_message
-        t = threading.Thread(target=self._loop, daemon=True)
-        t.start()
+        threading.Thread(target=self._loop, daemon=True).start()
 
     def _loop(self):
-        """Reconnect loop – never gives up."""
+        """Reconnect loop — never gives up."""
         while True:
             try:
-                self._client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, MQTT_KEEPALIVE)
+                self._client.connect(
+                    MQTT_BROKER_HOST, MQTT_BROKER_PORT, MQTT_KEEPALIVE
+                )
                 self._client.loop_forever()
             except Exception as e:
-                logging.error(f"[MQTT] Connection failed: {e}. Retrying in {MQTT_RECONNECT_DELAY}s…")
+                logging.error(
+                    f"[MQTT] Failed: {e}. Retry in {MQTT_RECONNECT_DELAY}s"
+                )
                 time.sleep(MQTT_RECONNECT_DELAY)
 
     def _on_connect(self, client, userdata, flags, rc):
-        logging.info(f"[MQTT] Connected to broker (rc={rc})")
-        self._connected_to_broker = True
+        logging.info(f"[MQTT] Connected (rc={rc})")
         client.subscribe(MQTT_TOPIC_GREEN)
         client.subscribe(MQTT_TOPIC_BLUE)
         client.subscribe(MQTT_STATUS_GREEN)
         client.subscribe(MQTT_STATUS_BLUE)
 
     def _on_disconnect(self, client, userdata, rc):
-        logging.warning(f"[MQTT] Disconnected (rc={rc}). Will reconnect…")
-        self._connected_to_broker = False
+        logging.warning(f"[MQTT] Disconnected (rc={rc}). Reconnecting…")
 
     def _on_message(self, client, userdata, msg):
         topic   = msg.topic
-        payload = msg.payload.decode("utf-8").strip().lower()
-        logging.debug(f"[MQTT] {topic} → {payload}")
+        payload = msg.payload.decode().strip().lower()
+        logging.debug(f"[MQTT] {topic} -> {payload}")
 
-        # Connection announcements from ESP32s
         if topic == MQTT_STATUS_GREEN and payload == "connected":
             self.engine.on_button_connected("green")
-            return
-        if topic == MQTT_STATUS_BLUE and payload == "connected":
+        elif topic == MQTT_STATUS_BLUE and payload == "connected":
             self.engine.on_button_connected("blue")
-            return
-
-        # Button events
-        if topic == MQTT_TOPIC_GREEN and payload in ("short", "double", "long"):
+        elif topic == MQTT_TOPIC_GREEN and payload in ("short", "double", "long"):
             self.engine.event_queue.put(("green", payload))
         elif topic == MQTT_TOPIC_BLUE and payload in ("short", "double", "long"):
             self.engine.event_queue.put(("blue", payload))
 
 
 # =============================================================================
-#  SIMULATION MODE  (type commands from the console)
+#  SIMULATION MODE
 # =============================================================================
 
 def run_simulation(engine: MatchEngine):
-    """
-    Read lines from stdin and inject them as button events.
-    Syntax:
-        g         → green short press
-        b         → blue short press
-        gg        → green double press
-        bb        → blue double press
-        GL        → green long press
-        BL        → blue long press
-        connect   → simulate both buttons connecting
-    """
     print("\n=== SIMULATION MODE ===")
-    print("Commands: g/b (short)  gg/bb (double)  GL/BL (long)  connect")
-    print("Type 'connect' first to simulate both buttons connecting.\n")
+    print("  connect    – simulate both buttons connecting")
+    print("  g / b      – green / blue short press")
+    print("  gg / bb    – green / blue double press (undo)")
+    print("  GL / BL    – green / blue long press  (full reset)")
+    print()
 
-    # Simulate connection if desired immediately
-    def _sim_input():
+    def _loop():
         while True:
             try:
                 raw = input("sim> ").strip()
@@ -1232,10 +1081,9 @@ def run_simulation(engine: MatchEngine):
             elif raw.upper() == "BL":
                 engine.event_queue.put(("blue", "long"))
             else:
-                print("Unknown command. Use: g b gg bb GL BL connect")
+                print("  Unknown command.")
 
-    t = threading.Thread(target=_sim_input, daemon=True)
-    t.start()
+    threading.Thread(target=_loop, daemon=True).start()
 
 
 # =============================================================================
@@ -1243,31 +1091,23 @@ def run_simulation(engine: MatchEngine):
 # =============================================================================
 
 def main():
-    # Ensure image directory exists
-    os.makedirs(IMAGE_DIR, exist_ok=True)
-
-    # Create subsystems
     logger  = MatchLogger()
     display = DisplayManager()
     engine  = MatchEngine(display, logger)
 
-    # Graceful shutdown handler (Ctrl+C, SIGTERM)
     def _shutdown(sig, frame):
-        logger.event("Shutdown signal received. Closing log.")
+        logger.event("Shutdown signal received.")
         logger.close()
         sys.exit(0)
 
     signal.signal(signal.SIGINT,  _shutdown)
     signal.signal(signal.SIGTERM, _shutdown)
 
-    # Start MQTT (no-op if paho not installed)
-    if not SIMULATION_MODE:
-        mqtt_client = MQTTClient(engine)
-        mqtt_client.start()
-    else:
+    if SIMULATION_MODE:
         run_simulation(engine)
+    else:
+        MQTTClient(engine).start()
 
-    # Block forever in the engine loop
     engine.run()
 
 
