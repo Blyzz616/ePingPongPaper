@@ -307,22 +307,36 @@ class DisplayManager:
       - Building composite score images on demand
       - Pre-generating the next two score images in a background thread
 
-    PRE-GENERATION CONTRACT
-    -----------------------
-    Before returning from any score event, DisplayManager.pregenerate(gs)
-    is called.  It reads serve_num, left score, and right score from gs
-    (the state AFTER the point was awarded and serve advanced) and builds:
+    SERVE OVERLAY RULE — "show who serves NEXT"
+    --------------------------------------------
+    The overlay on every score image must show who will serve on the
+    NEXT point, not who served on the point that just finished.
 
-        /tmp/<serve_num:02d>.<left+1>-<right>.bmp
-        /tmp/<serve_num:02d>.<left>-<right+1>.bmp
+    Concretely:
+      - After the serve choice (0-0, serve 1): show serveleft/right
+        for whoever was chosen — they ARE about to serve, so this is
+        both "current server" and "next server" simultaneously.
+      - After serve 1 of a pair: the same player serves again (serve 2),
+        so the overlay stays the same.
+      - After serve 2 of a pair: the server rotates, so the overlay
+        changes to the OTHER side.
 
-    These are the two images that will be needed when the next button is
-    pressed.  They use the NEW serve_num (post-advance) because that is
-    what will be in GameState when the next point is scored and we go to
-    look up the pre-generated file.
+    Implementation: every image is built using the server state that
+    exists AFTER _advance_serve() has been called for that point.
+    We simulate this in pregenerate() by cloning gs and running
+    _advance_serve() on each clone before reading gs.server.
 
-    The lock ensures two back-to-back rapid presses don't corrupt each
-    other's file writes.
+    PRE-GENERATION FILENAMES
+    ------------------------
+    /tmp/<serve_num:02d>.<left>-<right>.bmp
+
+    serve_num is the value AFTER _advance_serve() runs for that point.
+    This matches what will be in gs.serve_num when the engine later
+    calls show_file() to display that image.
+
+    So when pre-generating "left scores next":
+      clone gs → call _advance_serve() → use resulting serve_num,
+      server, serve_count to build the image.
     """
 
     def __init__(self):
@@ -360,24 +374,30 @@ class DisplayManager:
 
     def build_score_image(
         self,
-        gs: GameState,
+        base_image: str,
+        next_server: str,
         left_score: int,
         right_score: int,
         serve_num: int,
     ) -> str:
         """
         Composite and write one score BMP.
-        Returns the output path (whether freshly built or already existing).
+
+        next_server: "left" or "right" — the server for the NEXT point.
+                     This determines which serve overlay is composited.
+        serve_num:   The serve number AFTER the advance that produced this
+                     score.  Used as the first part of the filename.
+
+        Returns the output path (builds it if not already on disk).
         """
         outfile = tmp_score_path(serve_num, left_score, right_score)
         if os.path.exists(outfile):
             return outfile
 
-        overlay, sx, sy = self._overlay_for(gs.server)
-        base = asset(gs.base_image)
+        overlay, sx, sy = self._overlay_for(next_server)
 
         Compositor.build_score(
-            base_img      = base,
+            base_img      = asset(base_image),
             serve_overlay = overlay,
             serve_x       = sx,
             serve_y       = sy,
@@ -390,54 +410,78 @@ class DisplayManager:
     def show_score(self, gs: GameState):
         """
         Show the score image for the current GameState.
-        Builds it synchronously if not already on disk.
+        gs.serve_num and gs.server are already post-advance at this point,
+        so they correctly represent the NEXT serve.
+        Builds synchronously if not already on disk.
         """
         path = tmp_score_path(gs.serve_num, gs.score["left"], gs.score["right"])
         if not os.path.exists(path):
-            self.build_score_image(gs, gs.score["left"], gs.score["right"], gs.serve_num)
+            self.build_score_image(
+                base_image  = gs.base_image,
+                next_server = gs.server,
+                left_score  = gs.score["left"],
+                right_score = gs.score["right"],
+                serve_num   = gs.serve_num,
+            )
         self.show_file(path)
 
     # ── Pre-generation ────────────────────────────────────────────────────
 
     def pregenerate(self, gs: GameState):
         """
-        Spawn a daemon thread to pre-build the two next score images.
+        Spawn a background thread to pre-build the two next score images.
 
-        We pre-generate based on the CURRENT serve_num (after the last
-        advance).  If either player scores on the current serve, the
-        resulting image filename will be:
-            /tmp/<current_serve_num:02d>.<l+1>-<r>.bmp
-            /tmp/<current_serve_num:02d>.<l>-<r+1>.bmp
+        For each possible outcome (left scores / right scores) we:
+          1. Clone gs.
+          2. Call _apply_point() on the clone — this increments the score
+             AND calls _advance_serve(), which increments serve_num and
+             possibly rotates gs.server.
+          3. Read the resulting serve_num, server, and score from the clone.
+          4. Build /tmp/<serve_num>.<left>-<right>.bmp using the clone's
+             server as the next-server overlay.
+
+        This means each pre-generated image already has the correct serve
+        indicator for whoever will serve AFTER that point is scored.
         """
-        gs_snap = gs.clone()   # immune to further main-thread mutations
+        gs_snap = gs.clone()   # snapshot is immune to main-thread mutations
 
         def _work():
             with self._pregen_lock:
-                sn = gs_snap.serve_num
-                l  = gs_snap.score["left"]
-                r  = gs_snap.score["right"]
-                overlay, sx, sy = self._overlay_for(gs_snap.server)
-                base = asset(gs_snap.base_image)
+                base = gs_snap.base_image
 
-                # Image if left scores next
-                p_l = tmp_score_path(sn, l + 1, r)
+                # ── Pre-generate: left scores next ─────────────────────────
+                gs_l = gs_snap.clone()
+                _apply_point(gs_l, "left")        # advances serve_num + server
+                p_l = tmp_score_path(
+                    gs_l.serve_num,
+                    gs_l.score["left"],
+                    gs_l.score["right"],
+                )
                 if not os.path.exists(p_l):
-                    Compositor.build_score(
-                        base_img=base, serve_overlay=overlay,
-                        serve_x=sx, serve_y=sy,
-                        left_score=l + 1, right_score=r,
-                        outfile=p_l,
+                    self.build_score_image(
+                        base_image  = base,
+                        next_server = gs_l.server,   # server AFTER this point
+                        left_score  = gs_l.score["left"],
+                        right_score = gs_l.score["right"],
+                        serve_num   = gs_l.serve_num,
                     )
                     logging.debug(f"[Pregen] {p_l}")
 
-                # Image if right scores next
-                p_r = tmp_score_path(sn, l, r + 1)
+                # ── Pre-generate: right scores next ────────────────────────
+                gs_r = gs_snap.clone()
+                _apply_point(gs_r, "right")
+                p_r = tmp_score_path(
+                    gs_r.serve_num,
+                    gs_r.score["left"],
+                    gs_r.score["right"],
+                )
                 if not os.path.exists(p_r):
-                    Compositor.build_score(
-                        base_img=base, serve_overlay=overlay,
-                        serve_x=sx, serve_y=sy,
-                        left_score=l, right_score=r + 1,
-                        outfile=p_r,
+                    self.build_score_image(
+                        base_image  = base,
+                        next_server = gs_r.server,   # server AFTER this point
+                        left_score  = gs_r.score["left"],
+                        right_score = gs_r.score["right"],
+                        serve_num   = gs_r.serve_num,
                     )
                     logging.debug(f"[Pregen] {p_r}")
 
@@ -705,9 +749,15 @@ class MatchEngine:
             self.logger.blank()
             self.logger.serve_header(gs)
 
-            # Build and show the initial 0-0 image (must be synchronous —
-            # nothing is pre-generated yet at this moment).
-            self.display.build_score_image(gs, 0, 0, gs.serve_num)
+            # Build and show the initial 0-0 image synchronously.
+            # gs.server is already the correct next-server (the chosen side).
+            self.display.build_score_image(
+                base_image  = gs.base_image,
+                next_server = gs.server,
+                left_score  = 0,
+                right_score = 0,
+                serve_num   = gs.serve_num,
+            )
             self.display.show_score(gs)
 
             # Pre-generate both first-point outcomes in background.
@@ -753,7 +803,16 @@ class MatchEngine:
         img_path = tmp_score_path(gs.serve_num, new_left, new_right)
         if not os.path.exists(img_path):
             logging.warning(f"[Engine] Pre-generated image missing: {img_path} – building now")
-            self.display.build_score_image(gs, new_left, new_right, gs.serve_num)
+            # Simulate advance to determine next server for the overlay.
+            gs_tmp = gs.clone()
+            _apply_point(gs_tmp, side)
+            self.display.build_score_image(
+                base_image  = gs_tmp.base_image,
+                next_server = gs_tmp.server,
+                left_score  = new_left,
+                right_score = new_right,
+                serve_num   = gs.serve_num,   # use PRE-advance num (filename key)
+            )
         self.display.show_file(img_path)
 
         # ── Step 4: save undo snapshot ─────────────────────────────────────
@@ -841,7 +900,13 @@ class MatchEngine:
                 gs.state = State.PLAYING
                 self.logger.blank()
                 self.logger.serve_header(gs)
-                self.display.build_score_image(gs, 0, 0, gs.serve_num)
+                self.display.build_score_image(
+                    base_image  = gs.base_image,
+                    next_server = gs.server,
+                    left_score  = 0,
+                    right_score = 0,
+                    serve_num   = gs.serve_num,
+                )
                 self.display.show_score(gs)
                 self.display.pregenerate(gs)
             return
@@ -860,7 +925,13 @@ class MatchEngine:
             gs.state = State.PLAYING
             self.logger.blank()
             self.logger.serve_header(gs)
-            self.display.build_score_image(gs, 0, 0, gs.serve_num)
+            self.display.build_score_image(
+                base_image  = gs.base_image,
+                next_server = gs.server,
+                left_score  = 0,
+                right_score = 0,
+                serve_num   = gs.serve_num,
+            )
             self.display.show_score(gs)
             self.display.pregenerate(gs)
 
@@ -886,8 +957,13 @@ class MatchEngine:
             # synchronously) when we were in that state previously.
             path = tmp_score_path(gs.serve_num, gs.score["left"], gs.score["right"])
             if not os.path.exists(path):
+                # gs.server is already restored to the correct next-server.
                 self.display.build_score_image(
-                    gs, gs.score["left"], gs.score["right"], gs.serve_num
+                    base_image  = gs.base_image,
+                    next_server = gs.server,
+                    left_score  = gs.score["left"],
+                    right_score = gs.score["right"],
+                    serve_num   = gs.serve_num,
                 )
             self.display.show_file(path)
             self.display.pregenerate(gs)
