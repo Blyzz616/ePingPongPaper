@@ -3,7 +3,7 @@
 =============================================================================
  Ping-Pong Scoring System — Raspberry Pi Zero W v1
  IT8951 800x600 e-paper  +  2x ESP32-C6 MQTT buttons
- Version 1.2
+ Version 1.4
 =============================================================================
 
 ASSET INVENTORY (/home/jim/images/)
@@ -98,7 +98,7 @@ from datetime import datetime
 from enum import Enum, auto
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION = "1.2"
+VERSION = "1.4"
 
 # Handle --version / -v before anything else
 if "--version" in sys.argv or "-v" in sys.argv:
@@ -175,7 +175,8 @@ def digit_path(n: int) -> str:
     return asset(f"{n}.bmp")
 
 def games_digit_path(n: int) -> str:
-    return asset(f"g{n}.bmp")
+    """g0/g1/g2 only exist; clamp so we never request a missing file."""
+    return asset(f"g{min(n, 2)}.bmp")
 
 def tmp_score_path(serve_num: int, next_server: str, left: int, right: int) -> str:
     """
@@ -187,7 +188,7 @@ def tmp_score_path(serve_num: int, next_server: str, left: int, right: int) -> s
     next_server is included because the same score at the same serve_num can
     require different overlays depending on whether a serve rotation occurred.
     """
-    return os.path.join(TMP_DIR, f"{SESSION_ID}.{serve_num:02d}.{next_server}.{left}-{right}.bmp")
+    return os.path.join(TMP_DIR, f"{SESSION_ID}.{serve_num:02d}.{next_server}.{left}_{right}.bmp")
 
 
 # =============================================================================
@@ -198,7 +199,6 @@ class State(Enum):
     WAITING_BUTTONS = auto()
     RULE_RACE       = auto()
     RULE_BO         = auto()
-    CONFIRM_RULES   = auto()
     SERVING_CHOICE  = auto()
     PLAYING         = auto()
     WIN_CONFIRM     = auto()   # only for BO3 tied 1-1 extend prompt
@@ -507,7 +507,7 @@ class DisplayManager:
         gl = gs.games_won["left"]
         gr = gs.games_won["right"]
         outfile = os.path.join(
-            TMP_DIR, f"{SESSION_ID}.newgame.g{gs.current_game}.{gl}-{gr}.bmp"
+            TMP_DIR, f"{SESSION_ID}.newgame.g{gs.current_game}.{gl}_{gr}.bmp"
         )
         if not os.path.exists(outfile):
             overlay, sx, sy = self._overlay_for(gs.server)
@@ -535,7 +535,7 @@ class DisplayManager:
         """
         gl = gs.games_won["left"]
         gr = gs.games_won["right"]
-        outfile = os.path.join(TMP_DIR, f"{SESSION_ID}.matchover.{gl}-{gr}.bmp")
+        outfile = os.path.join(TMP_DIR, f"{SESSION_ID}.matchover.{gl}_{gr}.bmp")
         if not os.path.exists(outfile):
             Compositor.build_match_over(
                 best_of     = gs.best_of,
@@ -795,20 +795,10 @@ class MatchEngine:
         # ── RULE_BO: gl11/gl21.bmp on screen; green=3, blue=5 ─────────────
         elif state == State.RULE_BO:
             self._push_undo()
-            gs.best_of = 3 if colour == "green" else 5
-            self.logger.event(f"{colour.capitalize()} pressed – Best of {gs.best_of}")
-            gs.state = State.CONFIRM_RULES
-            conf = f"gl{gs.race_to}bo{gs.best_of}conf.bmp"
-            self.display.show_asset(conf)
-            self.logger.event(f"Confirmation screen: {conf}")
-
-        # ── CONFIRM_RULES: one tap from either player confirms ─────────────
-        elif state == State.CONFIRM_RULES:
-            self._push_undo()
+            gs.best_of    = 3 if colour == "green" else 5
             gs.base_image = base_image_name(gs.race_to, gs.best_of)
             self.logger.event(
-                f"{colour.capitalize()} pressed – Rules confirmed: "
-                f"race to {gs.race_to}, best of {gs.best_of}. "
+                f"{colour.capitalize()} pressed – Best of {gs.best_of}. "
                 f"Base image: {gs.base_image}"
             )
             gs.state = State.SERVING_CHOICE
@@ -817,6 +807,7 @@ class MatchEngine:
         # ── SERVING_CHOICE: first tap = first server ───────────────────────
         elif state == State.SERVING_CHOICE:
             self._push_undo()
+            self._clear_tmp_bmps()
             side           = GameState.colour_to_side(colour)
             gs.server      = side
             gs.serve_count = 1
@@ -1024,6 +1015,7 @@ class MatchEngine:
         # ── Green pressed: extend to best of 5 ────────────────────────────
         self.logger.event("Green pressed – extending to best of 5!")
         self._push_undo()
+        self._clear_tmp_bmps()
 
         winning_side     = gs.game_winner   # side that won the LAST game,
                                             # BEFORE the swap that start_new_game
@@ -1143,13 +1135,30 @@ class MatchEngine:
             self.display.show_asset("gamelen.bmp")
         elif s == State.RULE_BO:
             self.display.show_asset(f"gl{gs.race_to}.bmp")
-        elif s == State.CONFIRM_RULES:
-            self.display.show_asset(f"gl{gs.race_to}bo{gs.best_of}conf.bmp")
         elif s == State.SERVING_CHOICE:
             self.display.show_asset("serveask.bmp")
         elif s == State.MATCH_OVER:
             path = self.display.build_match_over_image(gs)
             self.display.show_file(path)
+
+    # ── /tmp cleanup ─────────────────────────────────────────────────────
+
+    @staticmethod
+    def _clear_tmp_bmps():
+        """Remove all .bmp files from TMP_DIR at the start of each match."""
+        try:
+            removed = 0
+            for fname in os.listdir(TMP_DIR):
+                if fname.lower().endswith(".bmp"):
+                    try:
+                        os.remove(os.path.join(TMP_DIR, fname))
+                        removed += 1
+                    except OSError as e:
+                        logging.warning(f"[Cleanup] Could not remove {fname}: {e}")
+            if removed:
+                logging.info(f"[Cleanup] Removed {removed} .bmp file(s) from {TMP_DIR}")
+        except Exception as e:
+            logging.warning(f"[Cleanup] /tmp scan failed: {e}")
 
     # ── Main event loop ───────────────────────────────────────────────────
 
