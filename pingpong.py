@@ -1,8 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """
 =============================================================================
  Ping-Pong Scoring System — Raspberry Pi Zero W v1
  IT8951 800x600 e-paper  +  2x ESP32-C6 buttons over MQTT
+ Version 0.7
 =============================================================================
 
 IMAGE PIPELINE OVERVIEW
@@ -113,9 +114,29 @@ SERVE_LEFT_Y  = 0
 SERVE_RIGHT_X = 518
 SERVE_RIGHT_Y = 0
 
+# serve.bmp — the "serving" bar shown on all in-game score screens
+SERVE_BAR_X   = 283
+SERVE_BAR_Y   = 27
+
+# switch.bmp — shown on the end-of-game screen
+SWITCH_X      = 256
+SWITCH_Y      = 26
+
+# Games-won digit positions (g0.bmp / g1.bmp / g2.bmp)
+GAMES_LEFT_X  = 164
+GAMES_RIGHT_X = 565
+GAMES_Y       = 477
+
 LOG_DIR = "logs"
 
 SIMULATION_MODE = "--sim" in sys.argv
+
+VERSION = "0.7"
+
+# Handle --version / -v immediately, before anything else runs
+if "--version" in sys.argv or "-v" in sys.argv:
+    print(f"pingpong.py version {VERSION}")
+    sys.exit(0)
 
 
 # =============================================================================
@@ -132,13 +153,21 @@ def digit_path(n: int) -> str:
     return asset(f"{n}.bmp")
 
 
-def tmp_score_path(serve_num: int, left: int, right: int) -> str:
+def tmp_score_path(serve_num: int, next_server: str, left: int, right: int) -> str:
     """
     Full path for a pre-generated score composite in /tmp.
-    Format:  /tmp/<serve_num:02d>.<left>-<right>.bmp
-    Example: /tmp/01.1-0.bmp
+
+    Format:  /tmp/<serve_num:02d>.<next_server>.<left>-<right>.bmp
+    Example: /tmp/02.left.1-1.bmp
+
+    next_server ("left" or "right") is included in the filename because
+    two different scoring paths can arrive at the same score on the same
+    serve_num but with different next servers (e.g. score 1-1 on serve 2
+    reached via green scoring is different from 1-1 on serve 2 reached
+    via blue scoring when one triggers a serve rotation and the other
+    doesn't).  Including the next server makes every filename unique.
     """
-    return os.path.join(TMP_DIR, f"{serve_num:02d}.{left}-{right}.bmp")
+    return os.path.join(TMP_DIR, f"{serve_num:02d}.{next_server}.{left}-{right}.bmp")
 
 
 # =============================================================================
@@ -237,18 +266,30 @@ class Compositor:
     """
     Composites pre-made BMP layers using ImageMagick.
 
-    All score images are built from exactly these four layers:
-      1. Base image     (rules-specific background)
-      2. Serve overlay  (serveleft.bmp or serveright.bmp at fixed position)
-      3. Left digit     (N.bmp at x=LEFT_SCORE_X, y=LEFT_SCORE_Y)
-      4. Right digit    (N.bmp at x=RIGHT_SCORE_X, y=RIGHT_SCORE_Y)
+    IN-GAME SCORE IMAGE layers (build_score):
+      1. Base image          (gl11bo3.bmp etc.)
+      2. serve.bmp           at (283, 27)   — always present during play
+      3. Serve-side overlay  (serveleft.bmp or serveright.bmp)
+      4. Left point digit    (N.bmp)        at (LEFT_SCORE_X,  LEFT_SCORE_Y)
+      5. Right point digit   (N.bmp)        at (RIGHT_SCORE_X, RIGHT_SCORE_Y)
+      6. Left games-won      (gN.bmp)       at (GAMES_LEFT_X,  GAMES_Y)
+      7. Right games-won     (gN.bmp)       at (GAMES_RIGHT_X, GAMES_Y)
 
-    ImageMagick composite syntax used:
-      convert base.bmp
-              overlay.bmp -geometry +Ox+Oy -composite
-              left.bmp    -geometry +Lx+Ly -composite
-              right.bmp   -geometry +Rx+Ry -composite
-              out.bmp
+    END-OF-GAME image layers (build_end_of_game) — shown when a game is won:
+      1. Base image
+      2. switch.bmp          at (256, 26)
+      3. serveleft.bmp       at (0, 0)
+      4. serveright.bmp      at (518, 0)
+      5. Left point digit    0 at (LEFT_SCORE_X,  LEFT_SCORE_Y)
+      6. Right point digit   0 at (RIGHT_SCORE_X, RIGHT_SCORE_Y)
+      7. Left games-won      (gN.bmp) at (GAMES_LEFT_X,  GAMES_Y)
+      8. Right games-won     (gN.bmp) at (GAMES_RIGHT_X, GAMES_Y)
+
+    MATCH-OVER image layers (build_match_over):
+      1. gameover.bmp  (BO5) or gameover3.bmp (BO3)
+      2. Left games-won digit  (N.bmp) at (LEFT_SCORE_X,  LEFT_SCORE_Y)
+      3. Right games-won digit (N.bmp) at (RIGHT_SCORE_X, RIGHT_SCORE_Y)
+      (no serve overlay, no small gN images — the point-score IS the game score)
     """
 
     @staticmethod
@@ -270,24 +311,115 @@ class Compositor:
         base_img: str,
         serve_overlay: str, serve_x: int, serve_y: int,
         left_score: int, right_score: int,
+        left_games: int, right_games: int,
         outfile: str,
     ) -> bool:
         """
-        Composite one complete score BMP from four pre-made layers.
-        Returns True on success.
+        Composite a normal in-game score image.
+
+        Layers (in order):
+          base -> serve.bmp@(283,27) -> serve-side overlay -> left digit
+               -> right digit -> left gN -> right gN
         """
         left_digit  = digit_path(left_score)
         right_digit = digit_path(right_score)
+        serve_bar   = asset("serve.bmp")
+        left_gdig   = asset(f"g{left_games}.bmp")
+        right_gdig  = asset(f"g{right_games}.bmp")
 
-        for p in (base_img, serve_overlay, left_digit, right_digit):
+        for p in (base_img, serve_bar, serve_overlay, left_digit, right_digit,
+                  left_gdig, right_gdig):
             if not os.path.exists(p):
                 logging.error(f"[Compositor] Missing asset: {p}")
                 return False
 
         args = [
             base_img,
+            serve_bar,
+            "-geometry", f"+{SERVE_BAR_X}+{SERVE_BAR_Y}", "-composite",
             serve_overlay,
             "-geometry", f"+{serve_x}+{serve_y}", "-composite",
+            left_digit,
+            "-geometry", f"+{LEFT_SCORE_X}+{LEFT_SCORE_Y}", "-composite",
+            right_digit,
+            "-geometry", f"+{RIGHT_SCORE_X}+{RIGHT_SCORE_Y}", "-composite",
+            left_gdig,
+            "-geometry", f"+{GAMES_LEFT_X}+{GAMES_Y}", "-composite",
+            right_gdig,
+            "-geometry", f"+{GAMES_RIGHT_X}+{GAMES_Y}", "-composite",
+        ]
+        return Compositor.run(args, outfile)
+
+    @staticmethod
+    def build_end_of_game(
+        base_img: str,
+        left_games: int, right_games: int,
+        outfile: str,
+    ) -> bool:
+        """
+        Composite the between-games screen shown when a game is won.
+
+        Shows: base + switch.bmp + both serve overlays + 0-0 point score
+               + updated games-won digits.
+        The winner has already been incremented in games_won before this
+        is called, so left_games/right_games reflect the new tally.
+        """
+        zero        = digit_path(0)
+        switch_img  = asset("switch.bmp")
+        sl          = asset("serveleft.bmp")
+        sr          = asset("serveright.bmp")
+        left_gdig   = asset(f"g{left_games}.bmp")
+        right_gdig  = asset(f"g{right_games}.bmp")
+
+        for p in (base_img, switch_img, sl, sr, zero, left_gdig, right_gdig):
+            if not os.path.exists(p):
+                logging.error(f"[Compositor] Missing asset: {p}")
+                return False
+
+        args = [
+            base_img,
+            switch_img,
+            "-geometry", f"+{SWITCH_X}+{SWITCH_Y}", "-composite",
+            sl,
+            "-geometry", f"+{SERVE_LEFT_X}+{SERVE_LEFT_Y}", "-composite",
+            sr,
+            "-geometry", f"+{SERVE_RIGHT_X}+{SERVE_RIGHT_Y}", "-composite",
+            zero,
+            "-geometry", f"+{LEFT_SCORE_X}+{LEFT_SCORE_Y}", "-composite",
+            zero,
+            "-geometry", f"+{RIGHT_SCORE_X}+{RIGHT_SCORE_Y}", "-composite",
+            left_gdig,
+            "-geometry", f"+{GAMES_LEFT_X}+{GAMES_Y}", "-composite",
+            right_gdig,
+            "-geometry", f"+{GAMES_RIGHT_X}+{GAMES_Y}", "-composite",
+        ]
+        return Compositor.run(args, outfile)
+
+    @staticmethod
+    def build_match_over(
+        best_of: int,
+        left_games: int, right_games: int,
+        outfile: str,
+    ) -> bool:
+        """
+        Composite the match-over screen.
+
+        Uses gameover.bmp (BO5) or gameover3.bmp (BO3) as the base.
+        The large point-digit positions show games won — no small gN images.
+        No sides are swapped here; left_games/right_games are as-is at the
+        moment the winning point was scored.
+        """
+        base_img    = asset("gameover.bmp" if best_of == 5 else "gameover3.bmp")
+        left_digit  = digit_path(left_games)
+        right_digit = digit_path(right_games)
+
+        for p in (base_img, left_digit, right_digit):
+            if not os.path.exists(p):
+                logging.error(f"[Compositor] Missing asset: {p}")
+                return False
+
+        args = [
+            base_img,
             left_digit,
             "-geometry", f"+{LEFT_SCORE_X}+{LEFT_SCORE_Y}", "-composite",
             right_digit,
@@ -378,19 +510,21 @@ class DisplayManager:
         next_server: str,
         left_score: int,
         right_score: int,
+        left_games: int,
+        right_games: int,
         serve_num: int,
     ) -> str:
         """
-        Composite and write one score BMP.
+        Composite and write one in-game score BMP.
 
-        next_server: "left" or "right" — the server for the NEXT point.
-                     This determines which serve overlay is composited.
-        serve_num:   The serve number AFTER the advance that produced this
-                     score.  Used as the first part of the filename.
+        next_server:  "left" or "right" — server for the NEXT point.
+        left_games:   current games won by left side (for gN overlay).
+        right_games:  current games won by right side.
+        serve_num:    global serve counter (post-advance); first part of filename.
 
-        Returns the output path (builds it if not already on disk).
+        Returns the output path (builds if not already on disk).
         """
-        outfile = tmp_score_path(serve_num, left_score, right_score)
+        outfile = tmp_score_path(serve_num, next_server, left_score, right_score)
         if os.path.exists(outfile):
             return outfile
 
@@ -403,24 +537,62 @@ class DisplayManager:
             serve_y       = sy,
             left_score    = left_score,
             right_score   = right_score,
+            left_games    = left_games,
+            right_games   = right_games,
             outfile       = outfile,
         )
+        return outfile
+
+    def build_end_of_game_image(self, gs: GameState) -> str:
+        """
+        Build and return the between-games screen path.
+        games_won already has the winner's tally incremented.
+        Uses a stable filename (not serve-keyed) since it's shown once.
+        """
+        gl = gs.games_won["left"]
+        gr = gs.games_won["right"]
+        outfile = os.path.join(TMP_DIR, f"endgame.{gs.current_game}.{gl}-{gr}.bmp")
+        if not os.path.exists(outfile):
+            Compositor.build_end_of_game(
+                base_img    = asset(gs.base_image),
+                left_games  = gl,
+                right_games = gr,
+                outfile     = outfile,
+            )
+        return outfile
+
+    def build_match_over_image(self, gs: GameState) -> str:
+        """
+        Build and return the match-over screen path.
+        games_won is NOT swapped — we display it as-is from the winning moment.
+        """
+        gl = gs.games_won["left"]
+        gr = gs.games_won["right"]
+        outfile = os.path.join(TMP_DIR, f"matchover.{gl}-{gr}.bmp")
+        if not os.path.exists(outfile):
+            Compositor.build_match_over(
+                best_of     = gs.best_of,
+                left_games  = gl,
+                right_games = gr,
+                outfile     = outfile,
+            )
         return outfile
 
     def show_score(self, gs: GameState):
         """
         Show the score image for the current GameState.
-        gs.serve_num and gs.server are already post-advance at this point,
-        so they correctly represent the NEXT serve.
+        gs.serve_num and gs.server are post-advance; they represent the NEXT serve.
         Builds synchronously if not already on disk.
         """
-        path = tmp_score_path(gs.serve_num, gs.score["left"], gs.score["right"])
+        path = tmp_score_path(gs.serve_num, gs.server, gs.score["left"], gs.score["right"])
         if not os.path.exists(path):
             self.build_score_image(
                 base_image  = gs.base_image,
                 next_server = gs.server,
                 left_score  = gs.score["left"],
                 right_score = gs.score["right"],
+                left_games  = gs.games_won["left"],
+                right_games = gs.games_won["right"],
                 serve_num   = gs.serve_num,
             )
         self.show_file(path)
@@ -454,15 +626,18 @@ class DisplayManager:
                 _apply_point(gs_l, "left")        # advances serve_num + server
                 p_l = tmp_score_path(
                     gs_l.serve_num,
+                    gs_l.server,            # next server AFTER this point
                     gs_l.score["left"],
                     gs_l.score["right"],
                 )
                 if not os.path.exists(p_l):
                     self.build_score_image(
                         base_image  = base,
-                        next_server = gs_l.server,   # server AFTER this point
+                        next_server = gs_l.server,
                         left_score  = gs_l.score["left"],
                         right_score = gs_l.score["right"],
+                        left_games  = gs_snap.games_won["left"],
+                        right_games = gs_snap.games_won["right"],
                         serve_num   = gs_l.serve_num,
                     )
                     logging.debug(f"[Pregen] {p_l}")
@@ -472,15 +647,18 @@ class DisplayManager:
                 _apply_point(gs_r, "right")
                 p_r = tmp_score_path(
                     gs_r.serve_num,
+                    gs_r.server,            # next server AFTER this point
                     gs_r.score["left"],
                     gs_r.score["right"],
                 )
                 if not os.path.exists(p_r):
                     self.build_score_image(
                         base_image  = base,
-                        next_server = gs_r.server,   # server AFTER this point
+                        next_server = gs_r.server,
                         left_score  = gs_r.score["left"],
                         right_score = gs_r.score["right"],
+                        left_games  = gs_snap.games_won["left"],
+                        right_games = gs_snap.games_won["right"],
                         serve_num   = gs_r.serve_num,
                     )
                     logging.debug(f"[Pregen] {p_r}")
@@ -727,7 +905,7 @@ class MatchEngine:
                 f"Base image: {gs.base_image}"
             )
             gs.state = State.SERVING_CHOICE
-            self.display.show_asset("serve.bmp")
+            self.display.show_asset("serveask.bmp")
             self.logger.write(
                 "Waiting for next button press to determine who serves first"
             )
@@ -756,6 +934,8 @@ class MatchEngine:
                 next_server = gs.server,
                 left_score  = 0,
                 right_score = 0,
+                left_games  = 0,
+                right_games = 0,
                 serve_num   = gs.serve_num,
             )
             self.display.show_score(gs)
@@ -773,7 +953,9 @@ class MatchEngine:
 
         # ── MATCH_OVER ─────────────────────────────────────────────────────
         elif state == State.MATCH_OVER:
-            self._show_match_summary()
+            # Re-show the match-over image (already built)
+            path = self.display.build_match_over_image(self.gs)
+            self.display.show_file(path)
 
     # ── Score a point ─────────────────────────────────────────────────────
 
@@ -800,18 +982,23 @@ class MatchEngine:
         # The serve_num used as the key is the CURRENT one (before _advance_serve
         # increments it).  That is the same number we used when pre-generating
         # this image after the PREVIOUS point.
-        img_path = tmp_score_path(gs.serve_num, new_left, new_right)
+        # Simulate the advance now so we know the next server —
+        # needed for both the filename lookup AND the fallback build.
+        gs_tmp = gs.clone()
+        _apply_point(gs_tmp, side)
+        next_server_after = gs_tmp.server   # server AFTER this point is awarded
+
+        img_path = tmp_score_path(gs_tmp.serve_num, next_server_after, new_left, new_right)
         if not os.path.exists(img_path):
             logging.warning(f"[Engine] Pre-generated image missing: {img_path} – building now")
-            # Simulate advance to determine next server for the overlay.
-            gs_tmp = gs.clone()
-            _apply_point(gs_tmp, side)
             self.display.build_score_image(
                 base_image  = gs_tmp.base_image,
-                next_server = gs_tmp.server,
+                next_server = next_server_after,
                 left_score  = new_left,
                 right_score = new_right,
-                serve_num   = gs.serve_num,   # use PRE-advance num (filename key)
+                left_games  = gs.games_won["left"],
+                right_games = gs.games_won["right"],
+                serve_num   = gs_tmp.serve_num,
             )
         self.display.show_file(img_path)
 
@@ -853,19 +1040,35 @@ class MatchEngine:
 
             m_winner = match_winner(gs)
             if m_winner:
+                # ── MATCH OVER: show gameover image with games-won as score ──
                 gs.state = State.MATCH_OVER
-                self._show_match_summary()
+                path = self.display.build_match_over_image(gs)
+                self.display.show_file(path)
+                self._log_match_summary()
                 return
+
+            # ── GAME OVER (not match): show between-games screen ──────────
+            total = gs.games_won["left"] + gs.games_won["right"]
+            is_extend_offer = (gs.best_of == 3 and total == 2)
 
             gs.state = State.WIN_CONFIRM
             self._win_confirmed = {"green": False, "blue": False}
 
-            total = gs.games_won["left"] + gs.games_won["right"]
-            if gs.best_of == 3 and total == 2:
+            if is_extend_offer:
                 gs.extend_prompt = True
-                self._show_extend_prompt()
+
+            # Build and show the end-of-game image (switch + both serve
+            # overlays + 0-0 + updated game scores).
+            path = self.display.build_end_of_game_image(gs)
+            self.display.show_file(path)
+
+            if is_extend_offer:
+                self.logger.event(
+                    "Games tied 1-1.  Green = extend to best of 5.  "
+                    "Blue = end match now."
+                )
             else:
-                self._show_win_confirm(winning_side)
+                self._log_win_confirm(winning_side)
             return
 
         # ── Step 8: normal point — log serve and pre-generate ──────────────
@@ -883,19 +1086,28 @@ class MatchEngine:
         gs = self.gs
 
         if gs.extend_prompt:
-            # Green (left) = YES extend to best of 5
-            # Blue (right) = NO  end match
+            # Green = YES extend to best of 5 / Blue = NO, end match now
             if colour == "blue":
+                # End the match now.  Build match-over image (BO3 base).
                 self.logger.event("Blue pressed – not extending. Match over.")
                 gs.state = State.MATCH_OVER
-                self._show_match_summary()
+                path = self.display.build_match_over_image(gs)
+                self.display.show_file(path)
+                self._log_match_summary()
             else:
+                # Extend to best of 5.
+                # Rule: treat the match as if it was always BO5.
+                # The winner of game 2 (gs.game_winner, pre-swap side) has
+                # just won that game, so after start_new_game() they will be
+                # on the OPPOSITE side (sides swap each game).
                 self.logger.event("Green pressed – extending to best of 5!")
                 self._push_undo()
                 gs.best_of       = 5
                 gs.extend_prompt = False
                 gs.base_image    = base_image_name(gs.race_to, gs.best_of)
-                winning_side     = gs.game_winner
+                winning_side     = gs.game_winner   # side BEFORE swap
+                # start_new_game swaps games_won AND sets server to the
+                # winner's new side (opposite of winning_side).
                 start_new_game(gs, winning_side)
                 gs.state = State.PLAYING
                 self.logger.blank()
@@ -905,6 +1117,8 @@ class MatchEngine:
                     next_server = gs.server,
                     left_score  = 0,
                     right_score = 0,
+                    left_games  = gs.games_won["left"],
+                    right_games = gs.games_won["right"],
                     serve_num   = gs.serve_num,
                 )
                 self.display.show_score(gs)
@@ -930,6 +1144,8 @@ class MatchEngine:
                 next_server = gs.server,
                 left_score  = 0,
                 right_score = 0,
+                left_games  = gs.games_won["left"],
+                right_games = gs.games_won["right"],
                 serve_num   = gs.serve_num,
             )
             self.display.show_score(gs)
@@ -955,7 +1171,7 @@ class MatchEngine:
         if gs.state == State.PLAYING:
             # The image for the restored state was pre-generated (or built
             # synchronously) when we were in that state previously.
-            path = tmp_score_path(gs.serve_num, gs.score["left"], gs.score["right"])
+            path = tmp_score_path(gs.serve_num, gs.server, gs.score["left"], gs.score["right"])
             if not os.path.exists(path):
                 # gs.server is already restored to the correct next-server.
                 self.display.build_score_image(
@@ -963,6 +1179,8 @@ class MatchEngine:
                     next_server = gs.server,
                     left_score  = gs.score["left"],
                     right_score = gs.score["right"],
+                    left_games  = gs.games_won["left"],
+                    right_games = gs.games_won["right"],
                     serve_num   = gs.serve_num,
                 )
             self.display.show_file(path)
@@ -1000,7 +1218,8 @@ class MatchEngine:
 
     # ── Menu display helpers ───────────────────────────────────────────────
 
-    def _show_win_confirm(self, winning_side: str):
+    def _log_win_confirm(self, winning_side: str):
+        """Log the between-games state (display is handled by build_end_of_game_image)."""
         wc = GameState.side_to_colour(winning_side)
         self.logger.event(
             f"Game {self.gs.current_game} over – {wc.capitalize()} wins.  "
@@ -1009,12 +1228,8 @@ class MatchEngine:
             "Both tap to continue."
         )
 
-    def _show_extend_prompt(self):
-        self.logger.event(
-            "Games tied 1-1.  Green = extend to best of 5.  Blue = end match now."
-        )
-
-    def _show_match_summary(self):
+    def _log_match_summary(self):
+        """Log the match summary (display is handled by build_match_over_image)."""
         gs = self.gs
         w  = match_winner(gs)
         wc = GameState.side_to_colour(w) if w else "unknown"
@@ -1042,12 +1257,11 @@ class MatchEngine:
         elif s == State.CONFIRM_RULES:
             self.display.show_asset(f"gl{gs.race_to}bo{gs.best_of}conf.bmp")
         elif s == State.SERVING_CHOICE:
-            self.display.show_asset("serve.bmp")
+            self.display.show_asset("serveask.bmp")
         elif s == State.WIN_CONFIRM:
-            if gs.extend_prompt:
-                self._show_extend_prompt()
-            else:
-                self._show_win_confirm(gs.game_winner)
+            # Re-show the end-of-game image (already built for this game/score combo)
+            path = self.display.build_end_of_game_image(gs)
+            self.display.show_file(path)
 
     # ── Main event loop ───────────────────────────────────────────────────
 
