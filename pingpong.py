@@ -3,7 +3,7 @@
 =============================================================================
  Ping-Pong Scoring System — Raspberry Pi Zero W v1
  IT8951 800x600 e-paper  +  2x ESP32-C6 MQTT buttons
- Version 1.0
+ Version 1.1
 =============================================================================
 
 ASSET INVENTORY (/home/jim/images/)
@@ -98,7 +98,7 @@ from datetime import datetime
 from enum import Enum, auto
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION = "0.8"
+VERSION = "1.1"
 
 # Handle --version / -v before anything else
 if "--version" in sys.argv or "-v" in sys.argv:
@@ -959,7 +959,22 @@ class MatchEngine:
             f"Games: left {gs.games_won['left']} – {gs.games_won['right']} right"
         )
 
-        # Check for match win BEFORE swapping (games_won reflects current sides).
+        # For BO3: always show gameover3.bmp and enter WIN_CONFIRM so green
+        # can extend to BO5.  match_winner() is skipped for BO3 — the extend
+        # offer applies whether the result is 2-0 or 1-1.
+        if gs.best_of == 3:
+            gs.state         = State.WIN_CONFIRM
+            gs.extend_prompt = True
+            path = self.display.build_match_over_image(gs)   # gameover3.bmp
+            self.display.show_file(path)
+            self.logger.event(
+                f"Best-of-3 complete: left {gs.games_won['left']} – "
+                f"{gs.games_won['right']} right.  "
+                "Green = extend to best of 5.  Blue = new match."
+            )
+            return
+
+        # BO5 (or already-extended): check for match winner.
         m_winner = match_winner(gs)
         if m_winner:
             gs.state = State.MATCH_OVER
@@ -968,28 +983,7 @@ class MatchEngine:
             self._log_match_summary()
             return
 
-        total = gs.games_won["left"] + gs.games_won["right"]
-        is_extend_offer = (gs.best_of == 3 and total == 2)
-
-        if is_extend_offer:
-            # BO3 tied 1-1: ask to extend.  Show next-game image while waiting.
-            gs.state         = State.WIN_CONFIRM
-            gs.extend_prompt = True
-            # Temporarily preview what the next game would look like.
-            # We save this snapshot so undo from here restores correctly.
-            # Show the end-of-game state using the post-swap setup so players
-            # can see the games tally while deciding.
-            gs_preview = gs.clone()
-            start_new_game(gs_preview, winning_side)
-            path = self.display.build_new_game_image(gs_preview)
-            self.display.show_file(path)
-            self.logger.event(
-                "Games tied 1-1 in best-of-3.  "
-                "Green = extend to best of 5.  Blue = end match now."
-            )
-            return
-
-        # Normal game win: auto-advance immediately.
+        # BO5, no match winner yet — auto-advance to next game.
         start_new_game(gs, winning_side)
         gs.state = State.PLAYING
         self.logger.blank()
@@ -1002,32 +996,44 @@ class MatchEngine:
         # Pre-generate the first two possible outcomes of the new game.
         self.display.pregenerate(gs)
 
-    # ── BO3 tied 1-1 extend prompt ────────────────────────────────────────
+    # ── BO3 end-of-match prompt ──────────────────────────────────────────
 
     def _handle_win_confirm(self, colour: str):
         """
-        Green = extend to best of 5.
-        Blue  = end match now with current BO3 result.
+        Reached after any BO3 match completes (2-0 or 1-1 — always).
+
+        Green = extend to best of 5, treating the match as if it was
+                always BO5.  Game history and scores carry over.
+                Winner of the last game serves first in the next game.
+                Players swap sides (winner's new side = opposite of
+                winning_side, handled by start_new_game).
+
+        Blue  = start a completely new match from scratch (back to
+                gamelen.bmp, as if the system just booted).
         """
         gs = self.gs
 
         if colour == "blue":
-            self.logger.event("Blue pressed – not extending. Match over.")
-            gs.state = State.MATCH_OVER
-            path = self.display.build_match_over_image(gs)
-            self.display.show_file(path)
-            self._log_match_summary()
+            # Fresh start — identical to a long press reset.
+            self.logger.event(
+                "Blue pressed – not extending. Starting new match from scratch."
+            )
+            self._full_reset()
             return
 
-        # Green pressed — extend to best of 5.
+        # ── Green pressed: extend to best of 5 ────────────────────────────
         self.logger.event("Green pressed – extending to best of 5!")
         self._push_undo()
 
+        winning_side     = gs.game_winner   # side that won the LAST game,
+                                            # BEFORE the swap that start_new_game
+                                            # will perform.
         gs.best_of       = 5
         gs.extend_prompt = False
         gs.base_image    = base_image_name(gs.race_to, gs.best_of)
-        winning_side     = gs.game_winner   # side BEFORE the swap
 
+        # start_new_game: swaps games_won, resets score to 0-0, sets server
+        # to the winner's NEW side (opposite of winning_side because they swap).
         start_new_game(gs, winning_side)
         gs.state = State.PLAYING
         self.logger.blank()
