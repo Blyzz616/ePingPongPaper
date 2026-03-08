@@ -3,7 +3,7 @@
 =============================================================================
  Ping-Pong Scoring System — Raspberry Pi Zero W v1
  IT8951 800x600 e-paper  +  2x ESP32-C6 MQTT buttons
- Version 0.9
+ Version 1.0
 =============================================================================
 
 ASSET INVENTORY (/home/jim/images/)
@@ -567,21 +567,43 @@ class DisplayManager:
                 for side in ("left", "right"):
                     g = gs_snap.clone()
                     _apply_point(g, side)
-                    path = tmp_score_path(
-                        g.serve_num, g.server,
-                        g.score["left"], g.score["right"],
-                    )
-                    if not os.path.exists(path):
-                        self.build_score_image(
-                            base_image  = g.base_image,
-                            next_server = g.server,
-                            left_score  = g.score["left"],
-                            right_score = g.score["right"],
-                            left_games  = gs_snap.games_won["left"],
-                            right_games = gs_snap.games_won["right"],
-                            serve_num   = g.serve_num,
+
+                    if check_game_win(g) is not None:
+                        # This outcome wins the game.
+                        # Pre-build the new-game start image so it's ready
+                        # the instant _handle_game_win runs.
+                        g.game_history.append({
+                            "left":          g.score["left"],
+                            "right":         g.score["right"],
+                            "winner_side":   check_game_win(g),
+                            "winner_colour": GameState.side_to_colour(check_game_win(g)),
+                        })
+                        winning = check_game_win(g)
+                        g.games_won[winning] += 1
+                        if match_winner(g) is None:
+                            # Not a match winner — pre-build the new-game image.
+                            start_new_game(g, winning)
+                            self.build_new_game_image(g)
+                            logging.debug(f"[Pregen] new-game image for game {g.current_game}")
+                        # If it IS a match winner we could pre-build match-over,
+                        # but that's fast enough to build on demand.
+                    else:
+                        # Normal point — pre-build the score image.
+                        path = tmp_score_path(
+                            g.serve_num, g.server,
+                            g.score["left"], g.score["right"],
                         )
-                        logging.debug(f"[Pregen] {path}")
+                        if not os.path.exists(path):
+                            self.build_score_image(
+                                base_image  = g.base_image,
+                                next_server = g.server,
+                                left_score  = g.score["left"],
+                                right_score = g.score["right"],
+                                left_games  = gs_snap.games_won["left"],
+                                right_games = gs_snap.games_won["right"],
+                                serve_num   = g.serve_num,
+                            )
+                            logging.debug(f"[Pregen] {path}")
 
         threading.Thread(target=_work, daemon=True).start()
 
@@ -851,19 +873,25 @@ class MatchEngine:
         new_left  = gs_tmp.score["left"]
         new_right = gs_tmp.score["right"]
 
-        img_path = tmp_score_path(post_serve_num, post_server, new_left, new_right)
-        if not os.path.exists(img_path):
-            logging.warning(f"[Engine] Pre-gen missing: {img_path} — building now")
-            self.display.build_score_image(
-                base_image  = gs.base_image,
-                next_server = post_server,
-                left_score  = new_left,
-                right_score = new_right,
-                left_games  = gs.games_won["left"],
-                right_games = gs.games_won["right"],
-                serve_num   = post_serve_num,
-            )
-        self.display.show_file(img_path)
+        # Check whether this point will win the game.
+        # We use gs_tmp (which has the point already applied) to check.
+        will_win = check_game_win(gs_tmp) is not None
+
+        if not will_win:
+            # Normal point — show the pre-generated score image immediately.
+            img_path = tmp_score_path(post_serve_num, post_server, new_left, new_right)
+            if not os.path.exists(img_path):
+                logging.warning(f"[Engine] Pre-gen missing: {img_path} — building now")
+                self.display.build_score_image(
+                    base_image  = gs.base_image,
+                    next_server = post_server,
+                    left_score  = new_left,
+                    right_score = new_right,
+                    left_games  = gs.games_won["left"],
+                    right_games = gs.games_won["right"],
+                    serve_num   = post_serve_num,
+                )
+            self.display.show_file(img_path)
 
         # Save undo snapshot BEFORE mutating state.
         self._push_undo()
@@ -880,6 +908,8 @@ class MatchEngine:
         # Check for game win.
         winning_side = check_game_win(gs)
         if winning_side:
+            # Game-winning point: go straight to new-game / match-over image.
+            # (No score image shown — _handle_game_win sends the next image.)
             self._handle_game_win(winning_side, changed_server)
             return
 
