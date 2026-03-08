@@ -3,7 +3,7 @@
 =============================================================================
  Ping-Pong Scoring System — Raspberry Pi Zero W v1
  IT8951 800x600 e-paper  +  2x ESP32-C6 MQTT buttons
- Version 1.1
+ Version 1.2
 =============================================================================
 
 ASSET INVENTORY (/home/jim/images/)
@@ -98,7 +98,7 @@ from datetime import datetime
 from enum import Enum, auto
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION = "1.1"
+VERSION = "1.2"
 
 # Handle --version / -v before anything else
 if "--version" in sys.argv or "-v" in sys.argv:
@@ -959,10 +959,11 @@ class MatchEngine:
             f"Games: left {gs.games_won['left']} – {gs.games_won['right']} right"
         )
 
-        # For BO3: always show gameover3.bmp and enter WIN_CONFIRM so green
-        # can extend to BO5.  match_winner() is skipped for BO3 — the extend
-        # offer applies whether the result is 2-0 or 1-1.
-        if gs.best_of == 3:
+        # Check for match winner (works for both BO3 and BO5).
+        m_winner = match_winner(gs)
+
+        if m_winner and gs.best_of == 3:
+            # BO3 match complete — offer extend to BO5 before declaring over.
             gs.state         = State.WIN_CONFIRM
             gs.extend_prompt = True
             path = self.display.build_match_over_image(gs)   # gameover3.bmp
@@ -974,16 +975,15 @@ class MatchEngine:
             )
             return
 
-        # BO5 (or already-extended): check for match winner.
-        m_winner = match_winner(gs)
         if m_winner:
+            # BO5 (or extended) match complete — match over.
             gs.state = State.MATCH_OVER
             path = self.display.build_match_over_image(gs)
             self.display.show_file(path)
             self._log_match_summary()
             return
 
-        # BO5, no match winner yet — auto-advance to next game.
+        # No match winner yet — auto-advance to next game.
         start_new_game(gs, winning_side)
         gs.state = State.PLAYING
         self.logger.blank()
