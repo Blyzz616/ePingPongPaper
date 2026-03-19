@@ -77,7 +77,7 @@ Large 85 mm recordable talking buttons with built-in LEDs — one green, one blu
 
 ### Replacement Batteries *(×2 — one per button)*
 
-<img src="https://m.media-amazon.com/images/I/61lz2qJOSEL._AC_SL1200_.jpg" alt="HAWK'S WORK LiPo Battery" width="300"/>
+<img width="1198" height="1030" alt="image" src="https://github.com/user-attachments/assets/6e42a5bc-edb4-4daa-b363-187f18e5bab4" alt="HAWK'S WORK LiPo Battery" width="300"/>
 
 Each button runs from a 3.7V LiPo cell connected to the ESP32-C6's battery input via a small boost/charge circuit. These drop-in cells fit neatly in the modified button housing.
 
