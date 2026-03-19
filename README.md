@@ -13,9 +13,9 @@ The Pi acts as its own Wi-Fi access point, so the whole system is self-contained
 ```
 [Green Button]──┐
    ESP32-C6     │  Wi-Fi / MQTT       ┌─────────────────────┐
-                ├────────────────────▶│  Raspberry Pi Zero W │──▶ 6″ e-paper
-[Blue Button]───┘                     │  (MQTT broker +      │
-   ESP32-C6                           │   scoring logic)     │
+                ├───────────────────▶│  Raspberry Pi Zero W │──▶ 6″ e-paper
+[Blue Button]───┘                     │  (MQTT broker +     │
+   ESP32-C6                           │   scoring logic)    │
                                       └─────────────────────┘
 ```
 
