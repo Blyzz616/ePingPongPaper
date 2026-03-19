@@ -311,4 +311,4 @@ Format includes serve headers, score events, undo records, change-of-serve marke
 
 ## Licence
 
-MIT — do whatever you like with it, just don't blame me if your ping-pong rivalries get out of hand.
+MIT — do whatever you like with it, just don't blame me if your ping-pong rivalries get out of hand or Mike claims victory regardless of the score.
