@@ -60,7 +60,7 @@ An ultra-compact Wi-Fi + Bluetooth 5 module soldered inside each score button. C
 
 ### Score Buttons *(×2)*
 
-<img src="https://m.media-amazon.com/images/I/61z+7Q9R6ML._AC_SL1200_.jpg" alt="Recordable Talking Button" width="300"/>
+<img width="887" height="805" alt="image" src="https://github.com/user-attachments/assets/2fbcae6a-5147-4c4e-a297-c42e77e6b4de" alt="Recordable Talking Button" width="300" />
 
 Large 85 mm recordable talking buttons with built-in LEDs — one green, one blue. The original AAA battery compartment has been repurposed to house the ESP32-C6 and LiPo battery. The original button mechanism is wired to the ESP32's GPIO.
 
