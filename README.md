@@ -1,225 +1,214 @@
-# Ping-Pong Scorer – Setup Guide
-# Raspberry Pi OS "Trixie" (Debian 13) — NetworkManager edition
+# ePingPongPaper
 
-## Files in this package
-
-| File | Purpose |
-|------|---------|
-| `pingpong.py` | Main Pi Python program |
-| `button_green/button_green.ino` | Arduino sketch for the GREEN ESP32-C6 |
-| `button_blue/button_blue.ino` | Arduino sketch for the BLUE ESP32-C6 |
+> A wireless, battery-powered ping-pong scoring system built around a 6″ e-paper display, two ESP32-C6 score buttons, and a Raspberry Pi Zero W v1 running Raspberry Pi OS Trixie.
 
 ---
 
-## 1 – Raspberry Pi Zero W v1: OS & packages
+## How It Works
+
+Two large recordable buttons — one green, one blue — connect wirelessly over Wi-Fi to a Raspberry Pi Zero W. The Pi runs a local MQTT broker and hosts the scoring logic. Every button press is published as an MQTT event, and the scorer updates a 6″ e-paper display showing the current score, serve side, and games won.
+
+The Pi acts as its own Wi-Fi access point, so the whole system is self-contained — no router or internet connection required.
+
+```
+[Green Button]──┐
+   ESP32-C6     │  Wi-Fi / MQTT       ┌─────────────────────┐
+                ├────────────────────▶│  Raspberry Pi Zero W │──▶ 6″ e-paper
+[Blue Button]───┘                     │  (MQTT broker +      │
+   ESP32-C6                           │   scoring logic)     │
+                                      └─────────────────────┘
+```
+
+---
+
+## Hardware
+
+### Raspberry Pi Zero W v1
+
+<img src="https://assets.raspberrypi.com/static/51035ec4212f7cb9d8f55a5e33e78e57/2b8d7/zero-2-hero.jpg" alt="Raspberry Pi Zero W" width="480"/>
+
+The brains of the system. Runs Raspberry Pi OS Trixie (Debian 13), hosts a Mosquitto MQTT broker, and drives the e-paper display via SPI.
+
+| Spec | Detail |
+|---|---|
+| CPU | 1 GHz single-core ARM1176JZF-S |
+| RAM | 512 MB |
+| Wi-Fi | 802.11 b/g/n (2.4 GHz) |
+| GPIO | 40-pin header |
+| Power | Micro USB, 5V |
+
+---
+
+### Seeed Studio XIAO ESP32-C6 *(×2 — one per button)*
+
+<img src="https://files.seeedstudio.com/wiki/SeeedStudio-XIAO-ESP32C6/img/xiaoc6.jpg" alt="Seeed Studio XIAO ESP32-C6" width="360"/>
+
+An ultra-compact Wi-Fi + Bluetooth 5 module soldered inside each score button. Connects to the Pi's access point on boot, then publishes short/double/long press events over MQTT.
+
+| Spec | Detail |
+|---|---|
+| MCU | ESP32-C6 (RISC-V, 160 MHz) |
+| Wi-Fi | 802.11 b/g/n (2.4 GHz) |
+| Size | 21 × 17.5 mm |
+| GPIO | 11 digital I/O |
+| Power | 3.3V (via battery boost circuit) |
+
+- [Seeed Studio product page](https://www.seeedstudio.com/Seeed-Studio-XIAO-ESP32C6-p-5884.html)
+
+---
+
+### Score Buttons *(×2)*
+
+<img src="https://m.media-amazon.com/images/I/61z+7Q9R6ML._AC_SL1200_.jpg" alt="Recordable Talking Button" width="300"/>
+
+Large 85 mm recordable talking buttons with built-in LEDs — one green, one blue. The original AAA battery compartment has been repurposed to house the ESP32-C6 and LiPo battery. The original button mechanism is wired to the ESP32's GPIO.
+
+| Spec | Detail |
+|---|---|
+| Diameter | 85 × 85 mm |
+| Height | 35 mm |
+| Material | ABS plastic |
+| LED | Built-in, colour-matched |
+
+- [Amazon.ca listing](https://www.amazon.ca/Recordable-Talking-Button-Recording-Bright/dp/B0FLNVCPL3)
+
+---
+
+### Replacement Batteries *(×2 — one per button)*
+
+<img src="https://m.media-amazon.com/images/I/61lz2qJOSEL._AC_SL1200_.jpg" alt="HAWK'S WORK LiPo Battery" width="300"/>
+
+Each button runs from a 3.7V LiPo cell connected to the ESP32-C6's battery input via a small boost/charge circuit. These drop-in cells fit neatly in the modified button housing.
+
+| Spec | Detail |
+|---|---|
+| Voltage | 3.7V |
+| Capacity | 550 mAh |
+| Connector | XH 2.54 |
+| Size | 47 × 20.7 × 7.5 mm |
+| Weight | 12.5 g |
+| Protection IC | Built-in (over-charge / over-discharge) |
+
+- [Amazon.ca listing](https://www.amazon.ca/HAWKS-WORK-Rechargeable-Helicopter-Connector/dp/B0DHX1KVFX/)
+
+---
+
+### 6″ E-Paper Display
+
+<img src="https://www.waveshare.com/w/upload/thumb/2/2d/6inch-e-Paper-HAT-1.jpg/600px-6inch-e-Paper-HAT-1.jpg" alt="Waveshare 6 inch e-paper HAT" width="480"/>
+
+Waveshare 6″ HD e-paper HAT driven by an IT8951 controller over SPI. Connects directly to the Pi Zero's GPIO header. Retains its image with zero power consumption when not updating.
+
+| Spec | Detail |
+|---|---|
+| Resolution | 800 × 600 |
+| Display size | 6 inches |
+| Controller | IT8951 |
+| Interface | SPI |
+| Refresh (GC16) | ~4 s — full quality, used for menus |
+| Refresh (A2) | ~0.3 s — fast binary, used for in-game scoring |
+| Colours | Black & white (A2 mode) / 16-level grayscale (GC16) |
+
+---
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `pingpong.py` | Main Pi scoring program |
+| `main.c` | IT8951 display binary wrapper (supports fast A2 mode) |
+| `button_green/button_green.ino` | Arduino sketch for the green ESP32-C6 |
+| `button_blue/button_blue.ino` | Arduino sketch for the blue ESP32-C6 |
+| `images/` | All BMP display assets |
+| `imagesassets.lst` | Full asset inventory with dimensions and coordinates |
+
+---
+
+## Display Assets
+
+All artwork lives in `/home/jim/images/` on the Pi. The scoring system uses two refresh strategies:
+
+- **GC16 (~4 s)** — full panel refresh for menus, game start, and match-over screens
+- **A2 (~0.3 s)** — partial update of only the changed element (one digit, or the serve arrow) for every scored point
+
+| Asset | Description |
+|---|---|
+| `gamelen.bmp` | Rule selection — choose race-to length |
+| `gl11.bmp` / `gl21.bmp` | Race-to-11 / race-to-21 chosen |
+| `serveask.bmp` | "Who serves first?" prompt |
+| `gl11bo3.bmp` … `gl21bo5.bmp` | In-game base images (one per rule combo) |
+| `serve.bmp` | Serve bar overlay (237×82 px) |
+| `serveleft.bmp` / `serveright.bmp` | Serve-side arrows (282×150 px) |
+| `serveblank.bmp` | Arrow eraser — same size as arrows |
+| `0.bmp` … `41.bmp` | Point score digits (330×215 px) |
+| `g0.bmp` … `g2.bmp` | Games-won digits (72×106 px) |
+| `gameover.bmp` | Match-over screen, best-of-5 |
+| `gameover3.bmp` | Match-over screen, best-of-3 |
+
+---
+
+## Setup
+
+### 1 — OS & Packages
 
 ```bash
-# Update
 sudo apt update && sudo apt upgrade -y
-
-# hostapd is still needed; dnsmasq is managed automatically
-# by NetworkManager's shared-mode hotspot feature
-sudo apt install -y hostapd
-
-# MQTT broker
-sudo apt install -y mosquitto mosquitto-clients
-
-# ImageMagick (BMP generation)
-sudo apt install -y imagemagick
-
-# Python deps
-# On Trixie, pip outside a venv requires --break-system-packages (PEP 668)
+sudo apt install -y mosquitto mosquitto-clients imagemagick git build-essential
 pip3 install paho-mqtt --break-system-packages
 ```
 
-> **Alternatively, use a venv (cleaner):**
-> ```bash
-> python3 -m venv /home/jim/scorer-venv
-> source /home/jim/scorer-venv/bin/activate
-> pip install paho-mqtt
-> ```
-> Then point the systemd `ExecStart` at `/home/jim/scorer-venv/bin/python`.
+### 2 — Wi-Fi Access Point (NetworkManager)
 
----
-
-## 2 – Wi-Fi Access Point via NetworkManager
-
-Trixie uses **NetworkManager** for all network management.
-**Do not edit `/etc/dhcpcd.conf`** — dhcpcd is not present in Trixie.
-Use `nmcli` to create a hotspot connection profile instead.
-
-### 2a — Create the hotspot profile
+Trixie uses NetworkManager — do **not** edit `dhcpcd.conf`.
 
 ```bash
 sudo nmcli con add \
-  type wifi \
-  ifname wlan0 \
-  con-name PingPongHotspot \
-  autoconnect yes \
-  ssid PingPong \
-  mode ap \
-  ipv4.method shared \
-  ipv4.addresses 192.168.4.1/29 \
-  wifi-sec.key-mgmt wpa-psk \
-  wifi-sec.psk "<supersecurepassword>" \
-  802-11-wireless.band bg \
-  802-11-wireless.channel 6
-```
+  type wifi ifname wlan0 con-name PingPongHotspot \
+  autoconnect yes ssid PingPong mode ap \
+  ipv4.method shared ipv4.addresses 192.168.4.1/29 \
+  wifi-sec.key-mgmt wpa-psk wifi-sec.psk "supersecurepassword" \
+  802-11-wireless.band bg 802-11-wireless.channel 6
 
-### 2b — Activate immediately
-
-```bash
 sudo nmcli con up PingPongHotspot
-
-# Verify the interface has the static IP
-ip addr show wlan0
-# Expected: inet 192.168.4.1/24
 ```
 
-`autoconnect yes` means NetworkManager will bring this hotspot up
-automatically on every subsequent boot — no further configuration needed.
-
-### 2c — DHCP for clients (automatic)
-
-When `ipv4.method shared` is set, NetworkManager spawns its own scoped
-dnsmasq instance on `wlan0` and writes its config to:
-
-```
-/run/NetworkManager/dnsmasq-wlan0.conf
-```
-
-You do **not** need to write a `/etc/dnsmasq.conf`.
-If you need to customise the DHCP range, drop an override into:
-
-```
-/etc/NetworkManager/dnsmasq-shared.d/pingpong.conf
-```
-
-Example contents:
-```
-dhcp-range=192.168.4.10,192.168.4.30,255.255.255.0,24h
-dhcp-option=3,192.168.4.1
-dhcp-option=6,192.168.4.1
-```
-
-Then reload: `sudo nmcli con down PingPongHotspot && sudo nmcli con up PingPongHotspot`
-
----
-
-## 3 – Mosquitto broker on Pi
-
-Create a config fragment (don't edit the default conf directly):
+### 3 — Mosquitto
 
 ```bash
 sudo tee /etc/mosquitto/conf.d/pingpong.conf << 'EOF'
 listener 1883 0.0.0.0
 allow_anonymous true
 EOF
-```
 
-```bash
 sudo systemctl enable mosquitto
 sudo systemctl restart mosquitto
-
-# Quick smoke-test
-mosquitto_sub -h 192.168.4.1 -t test &
-mosquitto_pub -h 192.168.4.1 -t test -m hello
-# Should print "hello"
 ```
 
----
-
-## 4 – IT8951 display driver
+### 4 — IT8951 Display Driver
 
 ```bash
-sudo apt install -y git build-essential
-git clone https://github.com/waveshare/IT8951-ePaper /home/jim/IT8951-src
-cd /home/jim/IT8951-src
-make
-sudo mkdir -p /IT8951
-sudo cp epd /IT8951/IT8951
-sudo chmod +x /IT8951/IT8951
+git clone https://github.com/waveshare/IT8951 /IT8951-src
+cd /IT8951-src
 ```
 
-Adjust `EPAPER_CMD` near the top of `pingpong.py` if your binary path differs.
-
----
-
-## 5 – Run the scorer
+Apply two edits (see `BUILD_INSTRUCTIONS.txt`), then:
 
 ```bash
-# Normal (MQTT + display) mode
+sudo make clean && sudo make
+sudo cp IT8951 /IT8951/IT8951
+```
+
+### 5 — Run the Scorer
+
+```bash
+# Live mode
 python3 /home/jim/pingpong.py
 
-# Simulation mode — no MQTT or display hardware needed
+# Simulation mode (no hardware needed)
 python3 /home/jim/pingpong.py --sim
 ```
 
-### Simulation commands
-
-| Input | Action |
-|-------|--------|
-| `connect` | Simulate both buttons connecting |
-| `g` | Green short press |
-| `b` | Blue short press |
-| `gg` | Green double press (undo) |
-| `bb` | Blue double press (undo) |
-| `GL` | Green long press (full reset) |
-| `BL` | Blue long press (full reset) |
-
----
-
-## 6 – Arduino IDE setup for ESP32-C6
-
-1. **File → Preferences → Additional Board Manager URLs:**
-   ```
-   https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
-   ```
-2. **Tools → Board → Boards Manager** → search `Seeed XIAO ESP32C6` → Install.
-3. **Tools → Board** → select `XIAO_ESP32C6`.
-4. **Sketch → Include Library → Manage Libraries** → install **PubSubClient** by Nick O'Leary.
-5. Open `button_green.ino` or `button_blue.ino`.
-6. Confirm the credentials at the top match your setup:
-   - `WIFI_SSID`     → `PingPongScorer`
-   - `WIFI_PASSWORD` → `pingpong123`
-   - `MQTT_SERVER`   → `192.168.4.1`
-7. Upload.
-
----
-
-## 7 – Button wiring (both ESP32-C6 units)
-
-```
-XIAO ESP32-C6 pin D1 ──┤ momentary button ├── GND
-```
-
-The firmware enables the internal pull-up resistor. No external resistor needed.
-
----
-
-## 8 – Hand-drawn artwork override
-
-Place any custom BMP (800×600, 1-bit monochrome) in:
-
-```
-/tmp/pingpong_imgs/override/<key>.bmp
-```
-
-The key for each screen is logged when that screen is first generated.
-Example key: `score_G3_B7_svgreen_s2_gm2_gl1_bl0`
-
----
-
-## 9 – Log files
-
-Each run writes to `logs/<epoch>.txt` in the working directory.
-Example: `logs/1772516165.txt`
-Format follows the specification exactly (serve headers, blank lines,
-"Change of serve" markers, undo records, timestamped events).
-
----
-
-## 10 – Autostart on boot (systemd)
+### 6 — Autostart on Boot
 
 ```bash
 sudo tee /etc/systemd/system/pingpong.service << 'EOF'
@@ -241,24 +230,84 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable pingpong
-sudo systemctl start  pingpong
-sudo systemctl status pingpong
+sudo systemctl start pingpong
 ```
 
-> `After=network-online.target` ensures NetworkManager has activated the
-> hotspot and Mosquitto is ready before the Python script starts.
-> NetworkManager's `NetworkManager-wait-online.service` satisfies
-> `network-online.target` on Trixie.
+### 7 — Arduino IDE (ESP32-C6 Buttons)
+
+1. **File → Preferences → Additional Board Manager URLs:**
+   ```
+   https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
+   ```
+2. **Tools → Board → Boards Manager** → search `Seeed XIAO ESP32C6` → Install
+3. **Tools → Board** → select `XIAO_ESP32C6`
+4. **Library Manager** → install **PubSubClient** by Nick O'Leary
+5. Open `button_green.ino` or `button_blue.ino` and confirm credentials:
+   - `WIFI_SSID` → `PingPong`
+   - `WIFI_PASSWORD` → *(your hotspot password)*
+   - `MQTT_SERVER` → `192.168.4.1`
+6. Upload
+
+#### Button Wiring
+
+```
+XIAO ESP32-C6 pin D1 ──┤ button mechanism ├── GND
+```
+
+Internal pull-up is enabled in firmware — no resistor needed.
 
 ---
 
-## 11 – Troubleshooting
+## Controls
+
+| Button | Action |
+|---|---|
+| Short press | Score a point for that side |
+| Double press | Undo last point |
+| Long press | Full reset (either button) |
+
+### Simulation Mode Commands
+
+| Input | Action |
+|---|---|
+| `connect` | Simulate both buttons connecting |
+| `g` / `b` | Green / blue short press |
+| `gg` / `bb` | Double press (undo) |
+| `GL` / `BL` | Long press (full reset) |
+
+---
+
+## Game Rules
+
+- **Race to:** 11 or 21 points (green = 11, blue = 21)
+- **Best of:** 3 or 5 games (green = 3, blue = 5)
+- **Win by two** rule applies at deuce
+- Serve rotates every 2 points; players swap ends after each game
+- Best-of-3 matches offer an optional extend-to-best-of-5 at match end
+
+---
+
+## Troubleshooting
 
 | Symptom | Check |
-|---------|-------|
+|---|---|
 | ESP32 can't see the AP | `nmcli con show PingPongHotspot` — confirm `GENERAL.STATE: activated` |
-| ESP32 connects but MQTT fails | `sudo systemctl status mosquitto` — confirm listening on `0.0.0.0:1883` |
-| Pi doesn't show 192.168.4.1 | `ip addr show wlan0` — re-run `sudo nmcli con up PingPongHotspot` |
-| Display not updating | Confirm `/IT8951/IT8951` exists and is executable |
-| ImageMagick BMP write error | Edit `/etc/ImageMagick-7/policy.xml` — find the `path` pattern `@*` and set `rights="read\|write"` |
-| pip install fails without flag | Use `--break-system-packages` or a venv (see section 1) |
+| MQTT connection refused | `sudo systemctl status mosquitto` — confirm listening on `0.0.0.0:1883` |
+| Pi not at 192.168.4.1 | `ip addr show wlan0` — re-run `sudo nmcli con up PingPongHotspot` |
+| Display not updating | Confirm `/IT8951/IT8951` exists and is executable (`ls -la /IT8951/`) |
+| ImageMagick BMP error | Edit `/etc/ImageMagick-7/policy.xml` — set `rights="read\|write"` for `path` pattern `@*` |
+| `pip install` fails | Add `--break-system-packages` or use a venv |
+
+---
+
+## Log Files
+
+Each run writes a timestamped log to `/home/jim/logs/<epoch>.txt`.
+
+Format includes serve headers, score events, undo records, change-of-serve markers, and full match summaries.
+
+---
+
+## Licence
+
+MIT — do whatever you like with it, just don't blame me if your ping-pong rivalries get out of hand.
