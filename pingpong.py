@@ -3,86 +3,74 @@
 =============================================================================
  Ping-Pong Scoring System — Raspberry Pi Zero W v1
  IT8951 800x600 e-paper  +  2x ESP32-C6 MQTT buttons
- Version 1.4
+ Version 2.0
 =============================================================================
 
 ASSET INVENTORY (/home/jim/images/)
 ------------------------------------
-Rule-selection (shown directly, no compositing):
+Rule-selection (shown directly, full GC16 refresh):
   gamelen.bmp            both buttons connected — choose race-to length
   gl11.bmp               after green tap: race-to-11 chosen, ask best-of
   gl21.bmp               after blue  tap: race-to-21 chosen, ask best-of
-  gl11bo3conf.bmp        confirmation screen: race-to-11, best-of-3
-  gl11bo5conf.bmp        confirmation screen: race-to-11, best-of-5
-  gl21bo3conf.bmp        confirmation screen: race-to-21, best-of-3
-  gl21bo5conf.bmp        confirmation screen: race-to-21, best-of-5
   serveask.bmp           "who serves first?" prompt
 
-In-game base images (composited onto for every score image):
+In-game base images (full GC16 refresh, once per game):
   gl11bo3.bmp            race-to-11, best-of-3
   gl11bo5.bmp            race-to-11, best-of-5
   gl21bo3.bmp            race-to-21, best-of-3
   gl21bo5.bmp            race-to-21, best-of-5
 
-serve.bmp overlay (always on in-game screens):
-  serve.bmp              placed at x=283, y=27
+Partial-update overlays (A2 fast refresh):
+  serve.bmp              237x82,  placed at x=283, y=27  (always on in-game)
+  serveleft.bmp          282x150, placed at x=0,   y=0   (left side serves)
+  serveright.bmp         282x150, placed at x=518, y=0   (right side serves)
+  serveblank.bmp         282x150, used to erase the inactive arrow
 
-Serve-side arrow overlays:
-  serveleft.bmp          placed at x=0,   y=0   (left side serves next)
-  serveright.bmp         placed at x=518, y=0   (right side serves next)
-
-Point-score digit images (0.bmp … 41.bmp):
+Point-score digit images (0.bmp … 41.bmp), each 330x215:
   Left  point digit:     x=35,  y=218
   Right point digit:     x=424, y=218
 
-Games-won digit images (g0.bmp, g1.bmp, g2.bmp):
+Games-won digit images (g0.bmp, g1.bmp, g2.bmp), each 72x106:
   Left  games digit:     x=164, y=477
   Right games digit:     x=565, y=477
 
-End-of-game (next-game start) screen — auto-displayed when a game is won:
-  Same base image as in-game
-  + serve.bmp @ (283, 27)
-  + serve-side overlay for who serves next
-    (winner of previous game serves — but they've swapped sides, so
-     if left won  -> winner is now on right -> serveright.bmp
-     if right won -> winner is now on left  -> serveleft.bmp)
-  + 0.bmp @ left  point position
-  + 0.bmp @ right point position
-  + gN.bmp @ left  games position  (post-swap games tally)
-  + gN.bmp @ right games position
+Match-over base images (full GC16 refresh):
+  gameover.bmp           used for best-of-5 (or extended) matches
+  gameover3.bmp          used for best-of-3 matches / extend prompt
 
-Match-over screen — auto-displayed when match is won:
-  gameover.bmp  (BO5) or  gameover3.bmp  (BO3/extended)  as base
-  + large point-digit at LEFT  position = left  games won
-  + large point-digit at RIGHT position = right games won
-  NO serve overlays, NO gN images (games tally IS the main score)
+Spare assets (not used in code):
+  switch.bmp             292x79, reserved for future use
+  gl11bo3conf.bmp        confirmation screens — documented but not used
+  gl11bo5conf.bmp
+  gl21bo3conf.bmp
+  gl21bo5conf.bmp
 
-PRE-GENERATION STRATEGY
------------------------
-After every serve, two BMPs are built in a background thread:
-  /tmp/<serve_num:02d>.<next_server>.<left>-<right>.bmp
+DISPLAY STRATEGY
+----------------
+  GC16 (mode 2, ~4s): full-screen menu images, base game image once per game,
+                       match-over screens.
+  A2   (mode 4, ~0.3s): all partial overlay updates during play.
 
-serve_num  — global monotonic counter, never resets across games.
-next_server — "left" or "right" — included because the same score at the
-              same serve_num can require different overlays depending on
-              whether this serve triggers a rotation or not.
-
-UNDO
-----
-GameState is deep-copied onto a stack before every mutation.
-Restoring a snapshot gives back the exact filename keys needed to re-
-display or re-pregenerate — no extra bookkeeping.
+Per-point update sends only the elements that changed:
+  - The one score digit that incremented
+  - Both arrow images (blank + new) only when serve switches
 
 STATE MACHINE
 -------------
   WAITING_BUTTONS  both ESP32s connect
   RULE_RACE        green=11, blue=21
   RULE_BO          green=3,  blue=5
-  CONFIRM_RULES    one tap confirms
   SERVING_CHOICE   first tap = first server
   PLAYING          live scoring
   WIN_CONFIRM      only used for BO3 tied 1-1 extend-to-5 prompt
   MATCH_OVER       match finished
+
+UNDO
+----
+GameState is deep-copied onto a stack before every mutation.
+After undo in PLAYING state all in-game elements are redrawn as partial
+updates (no base image re-flash needed since the base never changes
+mid-game).
 """
 
 import copy
@@ -98,7 +86,7 @@ from datetime import datetime
 from enum import Enum, auto
 
 # ── Version ───────────────────────────────────────────────────────────────────
-VERSION = "1.4"
+VERSION = "2.0"
 
 # Handle --version / -v before anything else
 if "--version" in sys.argv or "-v" in sys.argv:
@@ -129,39 +117,42 @@ MQTT_RECONNECT_DELAY = 5
 EPAPER_CMD = "/IT8951/IT8951"   # path to the IT8951 display binary
 
 ASSETS  = "/home/jim/images"   # Jim's pre-made artwork
-TMP_DIR = "/tmp"               # where composited score images are written
 
-# A unique tag for this process run.  Embedding it in every /tmp filename
-# means stale files from previous sessions are never reused.  (Stale files
-# without the gN-layer overlay — from an older version of the code — would
-# be silently reused without this tag, causing wrong images to be shown.)
-import time as _time
-SESSION_ID = str(int(_time.time()))
+LOG_DIR = "/home/jim/logs"
 
-# Point-score digit positions
+SIMULATION_MODE = ("-s" in sys.argv or "--sim" in sys.argv)
+
+# ── Display modes ─────────────────────────────────────────────────────────────
+DISPLAY_MODE_FULL = 2   # GC16 — full quality, ~4s, for menus and base images
+DISPLAY_MODE_FAST = 4   # A2   — binary fast,  ~0.3s, for in-game overlays
+
+# ── Asset dimensions (hardcoded — no runtime detection needed) ────────────────
+DIGIT_W        = 330    # 0.bmp – 41.bmp
+DIGIT_H        = 215
+GAMES_DIGIT_W  = 72     # g0.bmp – g2.bmp
+GAMES_DIGIT_H  = 106
+SERVE_BAR_W    = 237    # serve.bmp
+SERVE_BAR_H    = 82
+SERVE_ARROW_W  = 282    # serveleft.bmp, serveright.bmp, serveblank.bmp
+SERVE_ARROW_H  = 150
+
+# ── Overlay positions ─────────────────────────────────────────────────────────
 LEFT_SCORE_X  = 35
 LEFT_SCORE_Y  = 218
 RIGHT_SCORE_X = 424
 RIGHT_SCORE_Y = 218
 
-# serve.bmp overlay position (always shown during play)
 SERVE_BAR_X = 283
 SERVE_BAR_Y = 27
 
-# Serve-side arrow positions
 SERVE_LEFT_X  = 0
 SERVE_LEFT_Y  = 0
 SERVE_RIGHT_X = 518
 SERVE_RIGHT_Y = 0
 
-# Games-won digit positions
 GAMES_LEFT_X  = 164
 GAMES_RIGHT_X = 565
 GAMES_Y       = 477
-
-LOG_DIR = "logs"
-
-SIMULATION_MODE = ("-s" in sys.argv or "--sim" in sys.argv)
 
 
 # =============================================================================
@@ -178,17 +169,8 @@ def games_digit_path(n: int) -> str:
     """g0/g1/g2 only exist; clamp so we never request a missing file."""
     return asset(f"g{min(n, 2)}.bmp")
 
-def tmp_score_path(serve_num: int, next_server: str, left: int, right: int) -> str:
-    """
-    /tmp/<SESSION_ID>.<serve_num:02d>.<next_server>.<left>-<right>.bmp
-    e.g.  /tmp/1741234567.03.left.1-1.bmp
-
-    SESSION_ID prevents files from a previous run (possibly built with an
-    older code version that lacked certain overlay layers) from being reused.
-    next_server is included because the same score at the same serve_num can
-    require different overlays depending on whether a serve rotation occurred.
-    """
-    return os.path.join(TMP_DIR, f"{SESSION_ID}.{serve_num:02d}.{next_server}.{left}_{right}.bmp")
+def base_image_name(race_to: int, best_of: int) -> str:
+    return f"gl{race_to}bo{best_of}.bmp"
 
 
 # =============================================================================
@@ -225,8 +207,7 @@ class GameState:
     server is stored as "left" | "right", never as a colour string.
 
     serve_num counts every individual serve across the entire match
-    (never resets).  It is the primary key for pre-generated filenames,
-    so undo needs no extra bookkeeping — just restore the snapshot.
+    (never resets).
     """
 
     def __init__(self):
@@ -273,339 +254,216 @@ class GameState:
 
 
 # =============================================================================
-#  COMPOSITOR
-# =============================================================================
-
-class Compositor:
-    """
-    Thin ImageMagick wrapper.  All artwork is pre-made; this class only
-    composites layers together.
-
-    IN-GAME SCORE image (7 layers):
-      1. base (gl11bo3.bmp etc.)
-      2. serve.bmp           @ (SERVE_BAR_X, SERVE_BAR_Y)
-      3. serveleft/right.bmp @ serve-arrow position
-      4. left  point digit   @ (LEFT_SCORE_X,  LEFT_SCORE_Y)
-      5. right point digit   @ (RIGHT_SCORE_X, RIGHT_SCORE_Y)
-      6. left  gN digit      @ (GAMES_LEFT_X,  GAMES_Y)
-      7. right gN digit      @ (GAMES_RIGHT_X, GAMES_Y)
-
-    END-OF-GAME / NEXT-GAME START image (7 layers):
-      same structure, but point digits are 0-0 and the serve arrow
-      reflects the winner's new side (players have swapped).
-
-    MATCH-OVER image (3 layers):
-      1. gameover.bmp or gameover3.bmp
-      2. left  point digit = left  games won
-      3. right point digit = right games won
-      (no serve arrow, no gN digits — the point digit IS the game tally)
-    """
-
-    @staticmethod
-    def run(args: list, outfile: str) -> bool:
-        cmd = ["convert"] + args + [outfile]
-        try:
-            r = subprocess.run(cmd, capture_output=True, timeout=15)
-            if r.returncode != 0:
-                logging.warning(f"[IM] {r.stderr.decode().strip()}")
-                return False
-            return True
-        except Exception as e:
-            logging.error(f"[IM] exception: {e}")
-            return False
-
-    @staticmethod
-    def build_score(
-        base_img: str,
-        serve_overlay: str, serve_x: int, serve_y: int,
-        left_score: int, right_score: int,
-        left_games: int, right_games: int,
-        outfile: str,
-    ) -> bool:
-        """Build one in-game (or start-of-game) score composite."""
-        for p in (
-            base_img,
-            asset("serve.bmp"),
-            serve_overlay,
-            digit_path(left_score),
-            digit_path(right_score),
-            games_digit_path(left_games),
-            games_digit_path(right_games),
-        ):
-            if not os.path.exists(p):
-                logging.error(f"[Compositor] Missing asset: {p}")
-                return False
-
-        args = [
-            base_img,
-            asset("serve.bmp"),
-            "-geometry", f"+{SERVE_BAR_X}+{SERVE_BAR_Y}", "-composite",
-            serve_overlay,
-            "-geometry", f"+{serve_x}+{serve_y}", "-composite",
-            digit_path(left_score),
-            "-geometry", f"+{LEFT_SCORE_X}+{LEFT_SCORE_Y}", "-composite",
-            digit_path(right_score),
-            "-geometry", f"+{RIGHT_SCORE_X}+{RIGHT_SCORE_Y}", "-composite",
-            games_digit_path(left_games),
-            "-geometry", f"+{GAMES_LEFT_X}+{GAMES_Y}", "-composite",
-            games_digit_path(right_games),
-            "-geometry", f"+{GAMES_RIGHT_X}+{GAMES_Y}", "-composite",
-        ]
-        return Compositor.run(args, outfile)
-
-    @staticmethod
-    def build_match_over(
-        best_of: int,
-        left_games: int, right_games: int,
-        outfile: str,
-    ) -> bool:
-        """
-        Match-over screen.
-        gameover.bmp (BO5) or gameover3.bmp (BO3/extended).
-        Large point-digit slots show games won — no gN images, no serve arrow.
-        games_won is NOT swapped here; we display it as-is at the win moment.
-        """
-        base_img = asset("gameover.bmp" if best_of >= 5 else "gameover3.bmp")
-        for p in (base_img, digit_path(left_games), digit_path(right_games)):
-            if not os.path.exists(p):
-                logging.error(f"[Compositor] Missing asset: {p}")
-                return False
-
-        args = [
-            base_img,
-            digit_path(left_games),
-            "-geometry", f"+{LEFT_SCORE_X}+{LEFT_SCORE_Y}", "-composite",
-            digit_path(right_games),
-            "-geometry", f"+{RIGHT_SCORE_X}+{RIGHT_SCORE_Y}", "-composite",
-        ]
-        return Compositor.run(args, outfile)
-
-
-# =============================================================================
 #  DISPLAY MANAGER
 # =============================================================================
 
 class DisplayManager:
     """
-    Owns:
-      - Sending images to the e-paper
-      - Building composite score images on demand
-      - Pre-generating the next two images in a background thread
+    Owns all communication with the e-paper display.
 
-    SERVE OVERLAY RULE — always shows who serves NEXT
-    --------------------------------------------------
-    Every image is built using the server state AFTER _advance_serve()
-    has been called for that point.  This is achieved in pregenerate()
-    by cloning gs and running _apply_point() before reading gs.server.
+    All display calls are non-blocking — work is queued and executed
+    sequentially in a background thread.  Each queue item is a list of
+    (path, x, y, mode) tuples executed back-to-back, ensuring that a
+    multi-part update (e.g. base image + overlays) completes as an
+    atomic batch.
 
-    END-OF-GAME SERVE OVERLAY
+    REFRESH MODES
+    -------------
+    DISPLAY_MODE_FULL (GC16, ~4s): menus, base game image once per game,
+                                   match-over screens.
+    DISPLAY_MODE_FAST (A2,  ~0.3s): all in-game overlay updates.
+
+    PER-POINT UPDATE STRATEGY
     -------------------------
-    When a game is won, start_new_game() sets gs.server to the winner's
-    NEW side (which is the opposite of the winning side, because ends swap).
-    So gs.server at the start of the new game is already the correct
-    next-server for the end-of-game image.
+    show_score(gs, prev_gs) diffs the two states and sends only what
+    changed — typically a single digit image (~0.3s).  Arrow images are
+    only sent when the server changes (blank old side, draw new side).
 
-    FILENAME SCHEME
-    ---------------
-    /tmp/<serve_num:02d>.<next_server>.<left>-<right>.bmp
+    GAME START
+    ----------
+    setup_game_screen(gs) sends the full base image as GC16 followed by
+    all overlay images as A2 partial updates, all in one atomic batch.
     """
 
     def __init__(self):
-        self._pregen_lock = threading.Lock()
+        self._display_queue = queue.Queue()
+        threading.Thread(target=self._display_worker, daemon=True).start()
 
-    def show_file(self, path: str):
-        if not os.path.exists(path):
-            logging.error(f"[Display] File not found: {path}")
-            return
-        logging.info(f"[Display] -> {path}")
-        try:
-            subprocess.Popen(
-                [EPAPER_CMD, "0", "0", path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as e:
-            logging.error(f"[Display] IT8951 failed: {e}")
+    # ── Worker ────────────────────────────────────────────────────────────
+
+    def _display_worker(self):
+        """Drain the display queue one batch at a time."""
+        while True:
+            items = self._display_queue.get()
+            for path, x, y, mode in items:
+                if not os.path.exists(path):
+                    logging.error(f"[Display] Missing: {path}")
+                    continue
+                logging.info(f"[Display] -> {path} @ ({x},{y}) mode={mode}")
+                try:
+                    subprocess.run(
+                        [EPAPER_CMD, str(x), str(y), path, str(mode)],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=30,
+                    )
+                except subprocess.TimeoutExpired:
+                    logging.error(f"[Display] IT8951 timed out: {path}")
+                except Exception as e:
+                    logging.error(f"[Display] IT8951 failed: {e}")
+            self._display_queue.task_done()
+
+    def _flush_queue(self):
+        """Drop any pending (not yet started) display batches."""
+        while not self._display_queue.empty():
+            try:
+                self._display_queue.get_nowait()
+                self._display_queue.task_done()
+            except queue.Empty:
+                break
+
+    def _send(self, items: list):
+        """Queue a batch of (path, x, y, mode) tuples as one atomic unit."""
+        self._display_queue.put(items)
+
+    # ── Public API ────────────────────────────────────────────────────────
 
     def show_asset(self, filename: str):
-        self.show_file(asset(filename))
+        """Full-screen menu image — GC16 full refresh."""
+        self._flush_queue()
+        self._send([(asset(filename), 0, 0, DISPLAY_MODE_FULL)])
 
-    def _overlay_for(self, server: str) -> tuple:
-        """Return (overlay_path, x, y) for the given server side."""
+    def show_file(self, path: str, mode: int = DISPLAY_MODE_FULL):
+        """Full-screen file — used internally for match-over etc."""
+        self._flush_queue()
+        self._send([(path, 0, 0, mode)])
+
+    def update_elements(self, elements: list):
+        """
+        Partial A2 update.  elements is a list of (path, x, y).
+        All sent as one atomic batch.
+        """
+        self._flush_queue()
+        self._send([(p, x, y, DISPLAY_MODE_FAST) for p, x, y in elements])
+
+    # ── Arrow helpers ─────────────────────────────────────────────────────
+
+    def _arrow_elements(self, server: str) -> list:
+        """
+        Return (path, x, y) list that blanks the inactive arrow side
+        and draws the active one.  Always both sides to ensure correctness
+        regardless of what is currently on screen.
+        """
         if server == "left":
-            return asset("serveleft.bmp"), SERVE_LEFT_X, SERVE_LEFT_Y
-        return asset("serveright.bmp"), SERVE_RIGHT_X, SERVE_RIGHT_Y
+            return [
+                (asset("serveblank.bmp"), SERVE_RIGHT_X, SERVE_RIGHT_Y),
+                (asset("serveleft.bmp"),  SERVE_LEFT_X,  SERVE_LEFT_Y),
+            ]
+        else:
+            return [
+                (asset("serveblank.bmp"),  SERVE_LEFT_X,  SERVE_LEFT_Y),
+                (asset("serveright.bmp"),  SERVE_RIGHT_X, SERVE_RIGHT_Y),
+            ]
 
-    # ── Score image ───────────────────────────────────────────────────────
+    # ── Game screen setup ─────────────────────────────────────────────────
 
-    def build_score_image(
-        self,
-        base_image: str,
-        next_server: str,
-        left_score: int,
-        right_score: int,
-        left_games: int,
-        right_games: int,
-        serve_num: int,
-    ) -> str:
+    def setup_game_screen(self, gs: GameState):
         """
-        Composite one in-game score BMP and return its path.
-        next_server is the server for the NEXT point.
+        Full GC16 base image followed by A2 partial overlays.
+        Always called at score 0-0 (start of every game).
+        All items sent as one atomic batch so they cannot be interrupted.
+        Only the correct arrow side is drawn (no blank needed — the base
+        image has no arrows).
         """
-        outfile = tmp_score_path(serve_num, next_server, left_score, right_score)
-        if os.path.exists(outfile):
-            return outfile
-        overlay, sx, sy = self._overlay_for(next_server)
-        Compositor.build_score(
-            base_img      = asset(base_image),
-            serve_overlay = overlay,
-            serve_x       = sx,
-            serve_y       = sy,
-            left_score    = left_score,
-            right_score   = right_score,
-            left_games    = left_games,
-            right_games   = right_games,
-            outfile       = outfile,
-        )
-        return outfile
+        self._flush_queue()
 
-    def show_score(self, gs: GameState):
-        """Show the score image matching the current GameState (builds if missing)."""
-        path = tmp_score_path(
-            gs.serve_num, gs.server,
-            gs.score["left"], gs.score["right"],
-        )
-        if not os.path.exists(path):
-            self.build_score_image(
-                base_image  = gs.base_image,
-                next_server = gs.server,
-                left_score  = gs.score["left"],
-                right_score = gs.score["right"],
-                left_games  = gs.games_won["left"],
-                right_games = gs.games_won["right"],
-                serve_num   = gs.serve_num,
+        if gs.server == "left":
+            arrow = (asset("serveleft.bmp"), SERVE_LEFT_X, SERVE_LEFT_Y)
+        else:
+            arrow = (asset("serveright.bmp"), SERVE_RIGHT_X, SERVE_RIGHT_Y)
+
+        items = [
+            # Full base image — GC16
+            (asset(gs.base_image),                    0,             0,             DISPLAY_MODE_FULL),
+            # Overlays — A2
+            (asset("serve.bmp"),                      SERVE_BAR_X,   SERVE_BAR_Y,   DISPLAY_MODE_FAST),
+            (digit_path(0),                           LEFT_SCORE_X,  LEFT_SCORE_Y,  DISPLAY_MODE_FAST),
+            (digit_path(0),                           RIGHT_SCORE_X, RIGHT_SCORE_Y, DISPLAY_MODE_FAST),
+            (games_digit_path(gs.games_won["left"]),  GAMES_LEFT_X,  GAMES_Y,       DISPLAY_MODE_FAST),
+            (games_digit_path(gs.games_won["right"]), GAMES_RIGHT_X, GAMES_Y,       DISPLAY_MODE_FAST),
+            (*arrow,                                                                 DISPLAY_MODE_FAST),
+        ]
+        self._send(items)
+
+    # ── Per-point update ──────────────────────────────────────────────────
+
+    def show_score(self, gs: GameState, prev_gs: GameState):
+        """
+        Diff gs against prev_gs and send only the changed elements
+        as A2 partial updates.  Typically a single digit image (~0.3s).
+        Arrow images are only sent when the server changes.
+        """
+        elements = []
+
+        if gs.score["left"] != prev_gs.score["left"]:
+            elements.append(
+                (digit_path(gs.score["left"]), LEFT_SCORE_X, LEFT_SCORE_Y)
             )
-        self.show_file(path)
 
-    # ── End-of-game / next-game start image ──────────────────────────────
-
-    def build_new_game_image(self, gs: GameState) -> str:
-        """
-        Build the start-of-new-game image (score 0-0, games tally updated,
-        serve arrow for whoever serves the next game).
-
-        Called AFTER start_new_game() has already:
-          - swapped games_won
-          - set gs.server to the winner's new side
-          - reset score to 0-0
-
-        gs.server is therefore the correct next-server overlay.
-
-        Filename is keyed on game number and games tally so it's stable
-        and unambiguous (not serve-keyed, since serve_num hasn't advanced yet).
-        """
-        gl = gs.games_won["left"]
-        gr = gs.games_won["right"]
-        outfile = os.path.join(
-            TMP_DIR, f"{SESSION_ID}.newgame.g{gs.current_game}.{gl}_{gr}.bmp"
-        )
-        if not os.path.exists(outfile):
-            overlay, sx, sy = self._overlay_for(gs.server)
-            ok = Compositor.build_score(
-                base_img      = asset(gs.base_image),
-                serve_overlay = overlay,
-                serve_x       = sx,
-                serve_y       = sy,
-                left_score    = 0,
-                right_score   = 0,
-                left_games    = gl,
-                right_games   = gr,
-                outfile       = outfile,
+        if gs.score["right"] != prev_gs.score["right"]:
+            elements.append(
+                (digit_path(gs.score["right"]), RIGHT_SCORE_X, RIGHT_SCORE_Y)
             )
-            if not ok or not os.path.exists(outfile):
-                logging.error(f"[Display] build_new_game_image FAILED: {outfile}")
-        return outfile
 
-    # ── Match-over image ──────────────────────────────────────────────────
+        if gs.server != prev_gs.server:
+            elements += self._arrow_elements(gs.server)
 
-    def build_match_over_image(self, gs: GameState) -> str:
-        """
-        Build the match-over screen (games tally as main score, no swap).
-        games_won is used as-is — the winning point was just scored.
-        """
-        gl = gs.games_won["left"]
-        gr = gs.games_won["right"]
-        outfile = os.path.join(TMP_DIR, f"{SESSION_ID}.matchover.{gl}_{gr}.bmp")
-        if not os.path.exists(outfile):
-            Compositor.build_match_over(
-                best_of     = gs.best_of,
-                left_games  = gl,
-                right_games = gr,
-                outfile     = outfile,
+        if gs.games_won["left"] != prev_gs.games_won["left"]:
+            elements.append(
+                (games_digit_path(gs.games_won["left"]), GAMES_LEFT_X, GAMES_Y)
             )
-        return outfile
 
-    # ── Pre-generation ────────────────────────────────────────────────────
+        if gs.games_won["right"] != prev_gs.games_won["right"]:
+            elements.append(
+                (games_digit_path(gs.games_won["right"]), GAMES_RIGHT_X, GAMES_Y)
+            )
 
-    def pregenerate(self, gs: GameState):
+        if elements:
+            self.update_elements(elements)
+
+    def show_all_elements(self, gs: GameState):
         """
-        Background thread: build the two next score images.
-
-        For each outcome (left scores / right scores):
-          1. Clone gs
-          2. Call _apply_point() — advances score AND serve
-          3. Use resulting serve_num + server + score as the filename key
-          4. Build the composite with the clone's server as next-server overlay
-
-        Both images are keyed on POST-advance serve_num because that is
-        what will be in gs.serve_num when _handle_score runs next.
+        Redraw every in-game overlay as A2 partial updates.
+        Used after undo so the screen reflects the restored state
+        without needing a slow full base-image refresh.
+        _arrow_elements always blanks the inactive side and draws the
+        active side, guaranteeing correctness regardless of prior state.
         """
-        gs_snap = gs.clone()
+        elements = [
+            (asset("serve.bmp"),                     SERVE_BAR_X,   SERVE_BAR_Y),
+            (digit_path(gs.score["left"]),            LEFT_SCORE_X,  LEFT_SCORE_Y),
+            (digit_path(gs.score["right"]),           RIGHT_SCORE_X, RIGHT_SCORE_Y),
+            (games_digit_path(gs.games_won["left"]),  GAMES_LEFT_X,  GAMES_Y),
+            (games_digit_path(gs.games_won["right"]), GAMES_RIGHT_X, GAMES_Y),
+        ] + self._arrow_elements(gs.server)
+        self.update_elements(elements)
 
-        def _work():
-            with self._pregen_lock:
-                for side in ("left", "right"):
-                    g = gs_snap.clone()
-                    _apply_point(g, side)
+    # ── Match-over screen ─────────────────────────────────────────────────
 
-                    if check_game_win(g) is not None:
-                        # This outcome wins the game.
-                        # Pre-build the new-game start image so it's ready
-                        # the instant _handle_game_win runs.
-                        g.game_history.append({
-                            "left":          g.score["left"],
-                            "right":         g.score["right"],
-                            "winner_side":   check_game_win(g),
-                            "winner_colour": GameState.side_to_colour(check_game_win(g)),
-                        })
-                        winning = check_game_win(g)
-                        g.games_won[winning] += 1
-                        if match_winner(g) is None:
-                            # Not a match winner — pre-build the new-game image.
-                            start_new_game(g, winning)
-                            self.build_new_game_image(g)
-                            logging.debug(f"[Pregen] new-game image for game {g.current_game}")
-                        # If it IS a match winner we could pre-build match-over,
-                        # but that's fast enough to build on demand.
-                    else:
-                        # Normal point — pre-build the score image.
-                        path = tmp_score_path(
-                            g.serve_num, g.server,
-                            g.score["left"], g.score["right"],
-                        )
-                        if not os.path.exists(path):
-                            self.build_score_image(
-                                base_image  = g.base_image,
-                                next_server = g.server,
-                                left_score  = g.score["left"],
-                                right_score = g.score["right"],
-                                left_games  = gs_snap.games_won["left"],
-                                right_games = gs_snap.games_won["right"],
-                                serve_num   = g.serve_num,
-                            )
-                            logging.debug(f"[Pregen] {path}")
-
-        threading.Thread(target=_work, daemon=True).start()
+    def show_match_over(self, gs: GameState):
+        """
+        Full GC16 gameover base image then A2 partial updates for the
+        two games-won digits.  Sent as one atomic batch.
+        gameover.bmp for BO5/extended, gameover3.bmp for BO3.
+        """
+        self._flush_queue()
+        base = asset("gameover.bmp" if gs.best_of >= 5 else "gameover3.bmp")
+        items = [
+            (base,                                    0,             0,             DISPLAY_MODE_FULL),
+            (digit_path(gs.games_won["left"]),        LEFT_SCORE_X,  LEFT_SCORE_Y,  DISPLAY_MODE_FAST),
+            (digit_path(gs.games_won["right"]),       RIGHT_SCORE_X, RIGHT_SCORE_Y, DISPLAY_MODE_FAST),
+        ]
+        self._send(items)
 
 
 # =============================================================================
@@ -662,7 +520,7 @@ class MatchLogger:
 def _advance_serve(gs: GameState) -> bool:
     """
     Advance serve counter.
-    serve_num increments on every serve (both 1st and 2nd).
+    serve_num increments on every serve.
     serve_count cycles 1->2->(rotate server)->1.
     Returns True if the server changed.
     """
@@ -708,7 +566,7 @@ def start_new_game(gs: GameState, winning_side: str):
     The winner serves first in the new game, so server is set to
     the opposite of winning_side.
 
-    serve_num is NOT reset — it continues incrementing across games.
+    serve_num continues incrementing across games.
     """
     new_server = "right" if winning_side == "left" else "left"
     swap_games_won(gs)
@@ -727,10 +585,6 @@ def match_winner(gs: GameState):
     return None
 
 
-def base_image_name(race_to: int, best_of: int) -> str:
-    return f"gl{race_to}bo{best_of}.bmp"
-
-
 # =============================================================================
 #  MATCH ENGINE
 # =============================================================================
@@ -739,13 +593,13 @@ class MatchEngine:
     """
     Central controller.  Owns GameState, undo stack, display, and logger.
 
-    Critical timing for every scored point:
-      1. Simulate _apply_point on a clone to find post-advance server/serve_num
-      2. Look up (or build) the pre-generated image using those keys
-      3. Show the image immediately
-      4. Push undo snapshot
-      5. Apply the point for real (mutates gs)
-      6. Log; check game/match win; pre-generate next two images
+    Per-point flow:
+      1. Snapshot prev_gs before mutation
+      2. Push undo snapshot
+      3. Apply the point (mutates gs)
+      4. If game win → _handle_game_win
+      5. Otherwise  → display.show_score(gs, prev_gs) — partial diff update
+      6. Log serve state
     """
 
     def __init__(self, display: DisplayManager, logger: MatchLogger):
@@ -807,7 +661,6 @@ class MatchEngine:
         # ── SERVING_CHOICE: first tap = first server ───────────────────────
         elif state == State.SERVING_CHOICE:
             self._push_undo()
-            self._clear_tmp_bmps()
             side           = GameState.colour_to_side(colour)
             gs.server      = side
             gs.serve_count = 1
@@ -821,19 +674,8 @@ class MatchEngine:
             self.logger.blank()
             self.logger.serve_header(gs)
 
-            # Build the 0-0 start image synchronously (nothing pre-generated yet).
-            # gs.server is already correct (just set above).
-            self.display.build_score_image(
-                base_image  = gs.base_image,
-                next_server = gs.server,
-                left_score  = 0,
-                right_score = 0,
-                left_games  = gs.games_won["left"],
-                right_games = gs.games_won["right"],
-                serve_num   = gs.serve_num,
-            )
-            self.display.show_score(gs)
-            self.display.pregenerate(gs)
+            # Full base image + all overlays at 0-0
+            self.display.setup_game_screen(gs)
 
         # ── PLAYING ────────────────────────────────────────────────────────
         elif state == State.PLAYING:
@@ -845,8 +687,7 @@ class MatchEngine:
 
         # ── MATCH_OVER: long press resets; short press re-shows summary ────
         elif state == State.MATCH_OVER:
-            path = self.display.build_match_over_image(self.gs)
-            self.display.show_file(path)
+            self.display.show_match_over(self.gs)
 
     # ── Score a point ─────────────────────────────────────────────────────
 
@@ -854,40 +695,11 @@ class MatchEngine:
         gs   = self.gs
         side = GameState.colour_to_side(colour)
 
-        # Simulate the advance to find post-advance serve_num and server.
-        # This determines both the filename to look up AND the overlay to
-        # use if the image needs to be built synchronously.
-        gs_tmp = gs.clone()
-        _apply_point(gs_tmp, side)
-        post_server   = gs_tmp.server
-        post_serve_num = gs_tmp.serve_num
-        new_left  = gs_tmp.score["left"]
-        new_right = gs_tmp.score["right"]
+        # Snapshot before mutation — used to diff what changed for display
+        prev_gs = gs.clone()
 
-        # Check whether this point will win the game.
-        # We use gs_tmp (which has the point already applied) to check.
-        will_win = check_game_win(gs_tmp) is not None
-
-        if not will_win:
-            # Normal point — show the pre-generated score image immediately.
-            img_path = tmp_score_path(post_serve_num, post_server, new_left, new_right)
-            if not os.path.exists(img_path):
-                logging.warning(f"[Engine] Pre-gen missing: {img_path} — building now")
-                self.display.build_score_image(
-                    base_image  = gs.base_image,
-                    next_server = post_server,
-                    left_score  = new_left,
-                    right_score = new_right,
-                    left_games  = gs.games_won["left"],
-                    right_games = gs.games_won["right"],
-                    serve_num   = post_serve_num,
-                )
-            self.display.show_file(img_path)
-
-        # Save undo snapshot BEFORE mutating state.
+        # Save undo snapshot and apply the point
         self._push_undo()
-
-        # Apply the point for real.
         changed_server = _apply_point(gs, side)
 
         score_str = f"{gs.score['left']}-{gs.score['right']}"
@@ -896,21 +708,20 @@ class MatchEngine:
             f"{colour.capitalize()} scores. {score_str}"
         )
 
-        # Check for game win.
+        # Check for game win before showing score
         winning_side = check_game_win(gs)
         if winning_side:
-            # Game-winning point: go straight to new-game / match-over image.
-            # (No score image shown — _handle_game_win sends the next image.)
             self._handle_game_win(winning_side, changed_server)
             return
 
-        # Normal point: log serve state and kick off next pre-generation.
+        # Normal point — partial update of only what changed
+        self.display.show_score(gs, prev_gs)
+
         if changed_server:
             self.logger.serve_change()
         else:
             self.logger.blank()
         self.logger.serve_header(gs)
-        self.display.pregenerate(gs)
 
     # ── Game won ──────────────────────────────────────────────────────────
 
@@ -920,18 +731,12 @@ class MatchEngine:
 
         Behaviour:
           - Always auto-advance to next game (no confirmation required).
-          - Exception: BO3 tied 1-1 — pause and ask to extend to BO5.
-          - Match winner: show gameover image, enter MATCH_OVER state.
-
-        The start-of-new-game image is built using the serve-bar overlay
-        (serve.bmp) plus the correct serve-side arrow.  After start_new_game()
-        runs, gs.server is already the winner's new side (they swap ends, so
-        the winner's new side is opposite to winning_side).
+          - Exception: BO3 match complete — pause and ask to extend to BO5.
+          - Match winner: show match-over screen, enter MATCH_OVER state.
         """
         gs            = self.gs
         winner_colour = GameState.side_to_colour(winning_side)
 
-        # Record history and increment positional games tally.
         gs.game_history.append({
             "left":          gs.score["left"],
             "right":         gs.score["right"],
@@ -950,15 +755,13 @@ class MatchEngine:
             f"Games: left {gs.games_won['left']} – {gs.games_won['right']} right"
         )
 
-        # Check for match winner (works for both BO3 and BO5).
         m_winner = match_winner(gs)
 
         if m_winner and gs.best_of == 3:
-            # BO3 match complete — offer extend to BO5 before declaring over.
+            # BO3 match complete — offer extend to BO5
             gs.state         = State.WIN_CONFIRM
             gs.extend_prompt = True
-            path = self.display.build_match_over_image(gs)   # gameover3.bmp
-            self.display.show_file(path)
+            self.display.show_match_over(gs)
             self.logger.event(
                 f"Best-of-3 complete: left {gs.games_won['left']} – "
                 f"{gs.games_won['right']} right.  "
@@ -967,73 +770,56 @@ class MatchEngine:
             return
 
         if m_winner:
-            # BO5 (or extended) match complete — match over.
+            # BO5 (or extended) match complete
             gs.state = State.MATCH_OVER
-            path = self.display.build_match_over_image(gs)
-            self.display.show_file(path)
+            self.display.show_match_over(gs)
             self._log_match_summary()
             return
 
-        # No match winner yet — auto-advance to next game.
+        # No match winner yet — auto-advance to next game
         start_new_game(gs, winning_side)
         gs.state = State.PLAYING
         self.logger.blank()
         self.logger.serve_header(gs)
 
-        # Build and show the new-game 0-0 start image.
-        path = self.display.build_new_game_image(gs)
-        self.display.show_file(path)
+        # Full base image refresh + all overlays for new game at 0-0
+        self.display.setup_game_screen(gs)
 
-        # Pre-generate the first two possible outcomes of the new game.
-        self.display.pregenerate(gs)
-
-    # ── BO3 end-of-match prompt ──────────────────────────────────────────
+    # ── BO3 end-of-match prompt ───────────────────────────────────────────
 
     def _handle_win_confirm(self, colour: str):
         """
-        Reached after any BO3 match completes (2-0 or 1-1 — always).
+        Reached after any BO3 match completes.
 
-        Green = extend to best of 5, treating the match as if it was
-                always BO5.  Game history and scores carry over.
+        Green = extend to best of 5.  Game history and scores carry over.
                 Winner of the last game serves first in the next game.
-                Players swap sides (winner's new side = opposite of
-                winning_side, handled by start_new_game).
 
-        Blue  = start a completely new match from scratch (back to
-                gamelen.bmp, as if the system just booted).
+        Blue  = start a completely new match from scratch.
         """
         gs = self.gs
 
         if colour == "blue":
-            # Fresh start — identical to a long press reset.
             self.logger.event(
                 "Blue pressed – not extending. Starting new match from scratch."
             )
             self._full_reset()
             return
 
-        # ── Green pressed: extend to best of 5 ────────────────────────────
+        # ── Green: extend to best of 5 ────────────────────────────────────
         self.logger.event("Green pressed – extending to best of 5!")
         self._push_undo()
-        self._clear_tmp_bmps()
 
-        winning_side     = gs.game_winner   # side that won the LAST game,
-                                            # BEFORE the swap that start_new_game
-                                            # will perform.
+        winning_side     = gs.game_winner
         gs.best_of       = 5
         gs.extend_prompt = False
         gs.base_image    = base_image_name(gs.race_to, gs.best_of)
 
-        # start_new_game: swaps games_won, resets score to 0-0, sets server
-        # to the winner's NEW side (opposite of winning_side because they swap).
         start_new_game(gs, winning_side)
         gs.state = State.PLAYING
         self.logger.blank()
         self.logger.serve_header(gs)
 
-        path = self.display.build_new_game_image(gs)
-        self.display.show_file(path)
-        self.display.pregenerate(gs)
+        self.display.setup_game_screen(gs)
 
     # ── Undo ──────────────────────────────────────────────────────────────
 
@@ -1053,29 +839,13 @@ class MatchEngine:
         self.logger.serve_header(gs)
 
         if gs.state == State.PLAYING:
-            path = tmp_score_path(
-                gs.serve_num, gs.server,
-                gs.score["left"], gs.score["right"],
-            )
-            if not os.path.exists(path):
-                self.display.build_score_image(
-                    base_image  = gs.base_image,
-                    next_server = gs.server,
-                    left_score  = gs.score["left"],
-                    right_score = gs.score["right"],
-                    left_games  = gs.games_won["left"],
-                    right_games = gs.games_won["right"],
-                    serve_num   = gs.serve_num,
-                )
-            self.display.show_file(path)
-            self.display.pregenerate(gs)
+            # Redraw all in-game elements as partial updates.
+            # _arrow_elements blanks the inactive side, so this is correct
+            # regardless of what was on screen before the undo.
+            self.display.show_all_elements(gs)
         elif gs.state == State.WIN_CONFIRM:
-            # Undo back into the extend-or-end prompt:
-            # re-show the new-game preview image.
-            gs_preview = gs.clone()
-            start_new_game(gs_preview, gs.game_winner)
-            path = self.display.build_new_game_image(gs_preview)
-            self.display.show_file(path)
+            # Undoing back into the extend prompt — re-show match-over screen
+            self.display.show_match_over(gs)
         else:
             self._redraw_menu_state()
 
@@ -1138,27 +908,7 @@ class MatchEngine:
         elif s == State.SERVING_CHOICE:
             self.display.show_asset("serveask.bmp")
         elif s == State.MATCH_OVER:
-            path = self.display.build_match_over_image(gs)
-            self.display.show_file(path)
-
-    # ── /tmp cleanup ─────────────────────────────────────────────────────
-
-    @staticmethod
-    def _clear_tmp_bmps():
-        """Remove all .bmp files from TMP_DIR at the start of each match."""
-        try:
-            removed = 0
-            for fname in os.listdir(TMP_DIR):
-                if fname.lower().endswith(".bmp"):
-                    try:
-                        os.remove(os.path.join(TMP_DIR, fname))
-                        removed += 1
-                    except OSError as e:
-                        logging.warning(f"[Cleanup] Could not remove {fname}: {e}")
-            if removed:
-                logging.info(f"[Cleanup] Removed {removed} .bmp file(s) from {TMP_DIR}")
-        except Exception as e:
-            logging.warning(f"[Cleanup] /tmp scan failed: {e}")
+            self.display.show_match_over(gs)
 
     # ── Main event loop ───────────────────────────────────────────────────
 
