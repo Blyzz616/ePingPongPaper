@@ -25,7 +25,8 @@ The Pi acts as its own Wi-Fi access point, so the whole system is self-contained
 
 ### Raspberry Pi Zero W v1
 
-<img src="https://assets.raspberrypi.com/static/51035ec4212f7cb9d8f55a5e33e78e57/2b8d7/zero-2-hero.jpg" alt="Raspberry Pi Zero W" width="480"/>
+<img width="225" height="225" alt="image" src="https://github.com/user-attachments/assets/ade2fbc6-d5a9-443c-a962-209a76bea813"  alt="Raspberry Pi Zero W" width="480" />
+
 
 The brains of the system. Runs Raspberry Pi OS Trixie (Debian 13), hosts a Mosquitto MQTT broker, and drives the e-paper display via SPI.
 
