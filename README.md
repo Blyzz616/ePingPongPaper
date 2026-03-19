@@ -96,7 +96,7 @@ Each button runs from a 3.7V LiPo cell connected to the ESP32-C6's battery input
 
 ### 6″ E-Paper Display
 
-<img src="https://www.waveshare.com/w/upload/thumb/2/2d/6inch-e-Paper-HAT-1.jpg/600px-6inch-e-Paper-HAT-1.jpg" alt="Waveshare 6 inch e-paper HAT" width="480"/>
+<img width="800" height="800" alt="image" src="https://github.com/user-attachments/assets/7788a23f-a57c-4b73-9b2e-99cb20c4c45d" alt="Waveshare 6 inch e-paper HAT" width="480"/>
 
 Waveshare 6″ HD e-paper HAT driven by an IT8951 controller over SPI. Connects directly to the Pi Zero's GPIO header. Retains its image with zero power consumption when not updating.
 
