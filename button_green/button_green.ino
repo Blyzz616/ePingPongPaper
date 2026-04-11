@@ -268,6 +268,7 @@ void setup() {
   pinMode(SPEAKER_PIN, OUTPUT);
 
   // startup beep
+  delay(500);
   beep(1500, 150);
 
   mqtt.setServer(MQTT_SERVER, MQTT_PORT);
