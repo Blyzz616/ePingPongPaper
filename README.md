@@ -1,41 +1,39 @@
-# ePingPongPaper
+# 🏓 PingPong Scorer
 
-> A wireless, battery-powered ping-pong scoring system built around a 6″ e-paper display, two ESP32-C6 score buttons, and a Raspberry Pi Zero W v1 running Raspberry Pi OS Trixie.
+> A wireless, battery-powered ping-pong scoring system built around a Raspberry Pi 3, a TV display, and two ESP32-C6 score buttons.
 
 ---
 
 ## How It Works
 
-Two large recordable buttons — one green, one blue — connect wirelessly over Wi-Fi to a Raspberry Pi Zero W. The Pi runs a local MQTT broker and hosts the scoring logic. Every button press is published as an MQTT event, and the scorer updates a 6″ e-paper display showing the current score, serve side, and games won.
+Two large recordable buttons — one green, one blue — connect wirelessly over Wi-Fi directly to a Raspberry Pi 3. The Pi runs a local MQTT broker, hosts the game logic, and serves a real-time scoreboard web page to a TV via HDMI. Every button press is published as an MQTT event; the scorer updates the TV instantly over WebSocket with no perceptible delay.
 
-The Pi acts as its own Wi-Fi access point, so the whole system is self-contained — no router or internet connection required.
+The Pi acts as its own Wi-Fi access point, so the whole system is completely self-contained — no router, no internet connection required at the venue.
 
 ```
 [Green Button]──┐
-   ESP32-C6     │  Wi-Fi / MQTT        ┌─────────────────────┐
-                ├────────────────────▶│ Raspberry Pi Zero W │──▶ 6″ e-paper
-[Blue Button]───┘                      │  (MQTT broker +     │
-   ESP32-C6                            │   scoring logic)    │
-                                       └─────────────────────┘
+   ESP32-C6     │  Wi-Fi / MQTT        ┌──────────────────────────────┐
+                ├────────────────────▶│     Raspberry Pi 3           │
+[Blue Button]───┘                      │  hostapd AP + Mosquitto MQTT │
+   ESP32-C6                            │  Flask/SocketIO scorer       │──▶ TV (HDMI)
+                                       │  Firefox kiosk               │
+                                       └──────────────────────────────┘
 ```
 
 ---
 
 ## Hardware
 
-### Raspberry Pi Zero W v1
+### Raspberry Pi 3 Model B / B+
 
-<img width="225" height="225" alt="image" src="https://github.com/user-attachments/assets/ade2fbc6-d5a9-443c-a962-209a76bea813"  alt="Raspberry Pi Zero W" width="480" />
-
-
-The brains of the system. Runs Raspberry Pi OS Trixie (Debian 13), hosts a Mosquitto MQTT broker, and drives the e-paper display via SPI.
+The brains of the system. Runs Raspberry Pi OS (Debian Trixie), hosts a Mosquitto MQTT broker, runs the Flask/SocketIO scoring server, and drives a TV in kiosk mode via HDMI.
 
 | Spec | Detail |
 |---|---|
-| CPU | 1 GHz single-core ARM1176JZF-S |
-| RAM | 512 MB |
-| Wi-Fi | 802.11 b/g/n (2.4 GHz) |
-| GPIO | 40-pin header |
+| CPU | 1.2 GHz quad-core ARM Cortex-A53 |
+| RAM | 1 GB |
+| Wi-Fi | 802.11 b/g/n (2.4 GHz) — used as the AP |
+| Display | HDMI → TV or monitor |
 | Power | Micro USB, 5V |
 
 ---
@@ -44,7 +42,7 @@ The brains of the system. Runs Raspberry Pi OS Trixie (Debian 13), hosts a Mosqu
 
 <img src="https://files.seeedstudio.com/wiki/SeeedStudio-XIAO-ESP32C6/img/xiaoc6.jpg" alt="Seeed Studio XIAO ESP32-C6" width="360"/>
 
-An ultra-compact Wi-Fi + Bluetooth 5 module soldered inside each score button. Connects to the Pi's access point on boot, then publishes short/double/long press events over MQTT.
+An ultra-compact Wi-Fi module soldered inside each score button. Connects to the Pi's access point on boot, then publishes press events over MQTT. Also sends a heartbeat every 5 seconds and a battery voltage reading every 30 seconds.
 
 | Spec | Detail |
 |---|---|
@@ -52,7 +50,7 @@ An ultra-compact Wi-Fi + Bluetooth 5 module soldered inside each score button. C
 | Wi-Fi | 802.11 b/g/n (2.4 GHz) |
 | Size | 21 × 17.5 mm |
 | GPIO | 11 digital I/O |
-| Power | 3.3V (via battery boost circuit) |
+| Power | 3.7V LiPo via onboard charger circuit |
 
 - [Seeed Studio product page](https://www.seeedstudio.com/Seeed-Studio-XIAO-ESP32C6-p-5884.html)
 
@@ -62,7 +60,7 @@ An ultra-compact Wi-Fi + Bluetooth 5 module soldered inside each score button. C
 
 <img width="887" height="805" alt="image" src="https://github.com/user-attachments/assets/2fbcae6a-5147-4c4e-a297-c42e77e6b4de" alt="Recordable Talking Button" width="300" />
 
-Large 85 mm recordable talking buttons with built-in LEDs — one green, one blue. The original AAA battery compartment has been repurposed to house the ESP32-C6 and LiPo battery. The original button mechanism is wired to the ESP32's GPIO.
+Large 85 mm recordable talking buttons with built-in LEDs — one green, one blue. The original AAA battery compartment houses the ESP32-C6 and LiPo battery. The original button mechanism is wired to the ESP32's GPIO. A passive speaker on D2 beeps on every press for tactile confirmation.
 
 | Spec | Detail |
 |---|---|
@@ -70,16 +68,17 @@ Large 85 mm recordable talking buttons with built-in LEDs — one green, one blu
 | Height | 35 mm |
 | Material | ABS plastic |
 | LED | Built-in, colour-matched |
+| Speaker | Passive buzzer on GPIO D2 |
 
 - [Amazon.ca listing](https://www.amazon.ca/Recordable-Talking-Button-Recording-Bright/dp/B0FLNVCPL3)
 
 ---
 
-### Replacement Batteries *(×2 — one per button)*
+### Batteries *(×2 — one per button)*
 
 <img width="1198" height="1030" alt="image" src="https://github.com/user-attachments/assets/6e42a5bc-edb4-4daa-b363-187f18e5bab4" alt="HAWK'S WORK LiPo Battery" width="300"/>
 
-Each button runs from a 3.7V LiPo cell connected to the ESP32-C6's battery input via a small boost/charge circuit. These drop-in cells fit neatly in the modified button housing.
+Each button runs from a 3.7V LiPo cell. To recharge, remove the ESP32 from the button housing and charge the battery via USB. The ESP32 monitors supply voltage via ADC and reports approximate battery level to the scoreboard.
 
 | Spec | Detail |
 |---|---|
@@ -87,28 +86,20 @@ Each button runs from a 3.7V LiPo cell connected to the ESP32-C6's battery input
 | Capacity | 550 mAh |
 | Connector | XH 2.54 |
 | Size | 47 × 20.7 × 7.5 mm |
-| Weight | 12.5 g |
 | Protection IC | Built-in (over-charge / over-discharge) |
 
 - [Amazon.ca listing](https://www.amazon.ca/HAWKS-WORK-Rechargeable-Helicopter-Connector/dp/B0DHX1KVFX/)
 
 ---
 
-### 6″ E-Paper Display
+## Button Wiring
 
-<img width="800" height="800" alt="image" src="https://github.com/user-attachments/assets/7788a23f-a57c-4b73-9b2e-99cb20c4c45d" alt="Waveshare 6 inch e-paper HAT" width="480"/>
-
-Waveshare 6″ HD e-paper HAT driven by an IT8951 controller over SPI. Connects directly to the Pi Zero's GPIO header. Retains its image with zero power consumption when not updating.
-
-| Spec | Detail |
-|---|---|
-| Resolution | 800 × 600 |
-| Display size | 6 inches |
-| Controller | IT8951 |
-| Interface | SPI |
-| Refresh (GC16) | ~4 s — full quality, used for menus |
-| Refresh (A2) | ~0.3 s — fast binary, used for in-game scoring |
-| Colours | Black & white (A2 mode) / 16-level grayscale (GC16) |
+```
+XIAO ESP32-C6 D1 ──┤ button mechanism ├── GND   (internal pull-up, LOW = pressed)
+XIAO ESP32-C6 D2 ──┤ passive speaker  ├── GND   (beeps on press)
+XIAO ESP32-C6 A0 ──┤ voltage divider  ├── GND   (battery monitoring)
+                    100kΩ to BAT+, 100kΩ to GND
+```
 
 ---
 
@@ -116,125 +107,62 @@ Waveshare 6″ HD e-paper HAT driven by an IT8951 controller over SPI. Connects 
 
 | File | Purpose |
 |---|---|
-| `pingpong.py` | Main Pi scoring program |
-| `main.c` | IT8951 display binary wrapper (supports fast A2 mode) |
+| `pingpong_server.py` | Main Pi scoring server (Flask + SocketIO + MQTT + SQLite) |
+| `templates/scoreboard.html` | TV scoreboard web page (served by Flask) |
+| `setup.sh` | One-run Pi setup script |
 | `button_green/button_green.ino` | Arduino sketch for the green ESP32-C6 |
 | `button_blue/button_blue.ino` | Arduino sketch for the blue ESP32-C6 |
-| `images/` | All BMP display assets |
-| `imagesassets.lst` | Full asset inventory with dimensions and coordinates |
 
 ---
 
-## Display Assets
+## Network
 
-All artwork lives in `/home/jim/images/` on the Pi. The scoring system uses two refresh strategies:
-
-- **GC16 (~4 s)** — full panel refresh for menus, game start, and match-over screens
-- **A2 (~0.3 s)** — partial update of only the changed element (one digit, or the serve arrow) for every scored point
-
-| Asset | Description |
+| Parameter | Value |
 |---|---|
-| `gamelen.bmp` | Rule selection — choose race-to length |
-| `gl11.bmp` / `gl21.bmp` | Race-to-11 / race-to-21 chosen |
-| `serveask.bmp` | "Who serves first?" prompt |
-| `gl11bo3.bmp` … `gl21bo5.bmp` | In-game base images (one per rule combo) |
-| `serve.bmp` | Serve bar overlay (237×82 px) |
-| `serveleft.bmp` / `serveright.bmp` | Serve-side arrows (282×150 px) |
-| `serveblank.bmp` | Arrow eraser — same size as arrows |
-| `0.bmp` … `41.bmp` | Point score digits (330×215 px) |
-| `g0.bmp` … `g2.bmp` | Games-won digits (72×106 px) |
-| `gameover.bmp` | Match-over screen, best-of-5 |
-| `gameover3.bmp` | Match-over screen, best-of-3 |
+| AP SSID | `pingpong` |
+| AP password | Set during `setup.sh` |
+| Pi IP | `10.11.12.1` |
+| Subnet | `10.11.12.0/29` (6 usable hosts) |
+| MQTT broker | `10.11.12.1:1883` |
+| Scoreboard URL (on Pi) | `http://localhost:5000` |
+| Scoreboard URL (on network) | `http://10.11.12.1:5000` |
 
 ---
 
-## Setup
+## Pi Setup
 
-### 1 — OS & Packages
+### 1 — Flash Pi OS
 
-```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y mosquitto mosquitto-clients imagemagick git build-essential
-pip3 install paho-mqtt --break-system-packages
-```
+Use **Raspberry Pi OS with Desktop** (32-bit or 64-bit, Bookworm or Trixie). Enable SSH during imaging.
 
-### 2 — Wi-Fi Access Point (NetworkManager)
+### 2 — Run the Setup Script
 
-Trixie uses NetworkManager — do **not** edit `dhcpcd.conf`.
+Copy all project files to the Pi, then:
 
 ```bash
-sudo nmcli con add \
-  type wifi ifname wlan0 con-name PingPongHotspot \
-  autoconnect yes ssid PingPong mode ap \
-  ipv4.method shared ipv4.addresses 192.168.4.1/29 \
-  wifi-sec.key-mgmt wpa-psk wifi-sec.psk "supersecurepassword" \
-  802-11-wireless.band bg 802-11-wireless.channel 6
-
-sudo nmcli con up PingPongHotspot
+sudo bash setup.sh
 ```
 
-### 3 — Mosquitto
+The script will:
+- Ask for a Wi-Fi hotspot password (flash this same password into the ESP32s)
+- Install hostapd, dnsmasq, Mosquitto, Python venv, Firefox ESR
+- Configure `wlan0` as a Wi-Fi AP (`pingpong` / your password) at `10.11.12.1/29`
+- Create a `pingpong.service` systemd unit that starts the server on boot
+- Configure auto-login and Firefox kiosk mode on the HDMI output
+
+### 3 — Reboot
 
 ```bash
-sudo tee /etc/mosquitto/conf.d/pingpong.conf << 'EOF'
-listener 1883 0.0.0.0
-allow_anonymous true
-EOF
-
-sudo systemctl enable mosquitto
-sudo systemctl restart mosquitto
+sudo reboot
 ```
 
-### 4 — IT8951 Display Driver
+After reboot the Pi broadcasts the `pingpong` Wi-Fi network, starts the scoring server, and opens the scoreboard full-screen on the TV automatically.
 
-```bash
-git clone https://github.com/waveshare/IT8951 /IT8951-src
-cd /IT8951-src
-```
+---
 
-Apply two edits (see `BUILD_INSTRUCTIONS.txt`), then:
+## ESP32 Button Setup
 
-```bash
-sudo make clean && sudo make
-sudo cp IT8951 /IT8951/IT8951
-```
-
-### 5 — Run the Scorer
-
-```bash
-# Live mode
-python3 /home/jim/pingpong.py
-
-# Simulation mode (no hardware needed)
-python3 /home/jim/pingpong.py --sim
-```
-
-### 6 — Autostart on Boot
-
-```bash
-sudo tee /etc/systemd/system/pingpong.service << 'EOF'
-[Unit]
-Description=Ping-Pong Scorer
-After=network-online.target mosquitto.service
-Wants=network-online.target
-
-[Service]
-ExecStart=/usr/bin/python3 /home/jim/pingpong.py
-WorkingDirectory=/home/jim
-Restart=always
-RestartSec=5
-User=pi
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable pingpong
-sudo systemctl start pingpong
-```
-
-### 7 — Arduino IDE (ESP32-C6 Buttons)
+### Arduino IDE
 
 1. **File → Preferences → Additional Board Manager URLs:**
    ```
@@ -242,49 +170,153 @@ sudo systemctl start pingpong
    ```
 2. **Tools → Board → Boards Manager** → search `Seeed XIAO ESP32C6` → Install
 3. **Tools → Board** → select `XIAO_ESP32C6`
-4. **Library Manager** → install **PubSubClient** by Nick O'Leary
-5. Open `button_green.ino` or `button_blue.ino` and confirm credentials:
-   - `WIFI_SSID` → `PingPong`
-   - `WIFI_PASSWORD` → *(your hotspot password)*
-   - `MQTT_SERVER` → `192.168.4.1`
-6. Upload
+4. **Tools → Library Manager** → install **PubSubClient** by Nick O'Leary
+5. Open `button_green.ino` or `button_blue.ino` and set:
+   ```cpp
+   const char* WIFI_PASSWORD = "your_hotspot_password";
+   ```
+   Everything else (`WIFI_SSID = "pingpong"`, `MQTT_SERVER = "10.11.12.1"`) is pre-configured.
+6. **Tools → Port** — if no port appears, install the CH340 or CP2102 USB driver for your OS
+7. Upload to the correct button
 
-#### Button Wiring
+---
 
-```
-XIAO ESP32-C6 pin D1 ──┤ button mechanism ├── GND
-```
+## MQTT Topics
 
-Internal pull-up is enabled in firmware — no resistor needed.
+| Topic | Direction | Payload | Description |
+|---|---|---|---|
+| `button/green` | ESP32 → Pi | `short` / `double` / `reset` | Button press events |
+| `button/blue` | ESP32 → Pi | `short` / `double` / `reset` | Button press events |
+| `status/green` | ESP32 → Pi | `connected` | Retained, published on every WiFi connect |
+| `status/blue` | ESP32 → Pi | `connected` | Retained, published on every WiFi connect |
+| `heartbeat/green` | ESP32 → Pi | `ok` | Every 5 seconds |
+| `heartbeat/blue` | ESP32 → Pi | `ok` | Every 5 seconds |
+| `battery/green` | ESP32 → Pi | `0`–`100` or `-1` | Battery % every 30 seconds |
+| `battery/blue` | ESP32 → Pi | `0`–`100` or `-1` | Battery % every 30 seconds |
 
 ---
 
 ## Controls
 
-| Button | Action |
+| Press | Action |
 |---|---|
-| Short press | Score a point for that side |
-| Double press | Undo last point |
-| Long press | Full reset (either button) |
+| Short tap | Score a point / advance menu |
+| Double tap | Undo last point |
+| Quad-tap (4× within 500 ms each) | Full reset → jumps straight to rule selection |
 
-### Simulation Mode Commands
-
-| Input | Action |
-|---|---|
-| `connect` | Simulate both buttons connecting |
-| `g` / `b` | Green / blue short press |
-| `gg` / `bb` | Double press (undo) |
-| `GL` / `BL` | Long press (full reset) |
+**Green button** = top player on screen (far end of table)
+**Blue button** = bottom player on screen (near end of table)
 
 ---
 
-## Game Rules
+## Game Flow
 
-- **Race to:** 11 or 21 points (green = 11, blue = 21)
-- **Best of:** 3 or 5 games (green = 3, blue = 5)
-- **Win by two** rule applies at deuce
-- Serve rotates every 2 points; players swap ends after each game
-- Best-of-3 matches offer an optional extend-to-best-of-5 at match end
+```
+Quad-press either button at any time → instant reset to rule selection
+                │
+                ▼
+  Choose race-to length      Green = Race to 11     Blue = Race to 21
+                │
+                ▼
+  Choose best of             Green = Best of 3      Blue = Best of 5
+                │
+                ▼
+  Who serves first?          Tap your own button to claim first serve
+                │
+                ▼
+  PLAYING                    Tap your button each time YOU score
+                │
+           game ends
+                │
+     ┌──────────┴──────────┐
+     │                     │
+  Best-of-3             Best-of-5 / extended
+  complete?             → match over screen
+     │
+     ▼
+  Extend prompt
+  Green = play best of 5
+  Blue  = start new match
+```
+
+Players swap ends after every game. The games-won tally follows each player automatically.
+
+---
+
+## Serve Rotation
+
+- Each player serves **2 consecutive points**, then serve rotates
+- A glowing ball on the table graphic shows which end is currently serving
+- The `SERVE ● ●` dots in the score panel show the current serve count (1 or 2)
+
+---
+
+## Scoreboard Features
+
+| Feature | Detail |
+|---|---|
+| Real-time updates | WebSocket push — no polling, sub-100 ms response |
+| Loss of signal | Full-screen overlay after 4 seconds of no server contact |
+| Battery indicators | Per-button battery icon + % in each score panel; flashes red below 25% |
+| Connection status | Heartbeat-monitored; button marked disconnected after 12 s of silence |
+| Simulation mode | Press `S` to show sim panel — test full game flow without physical buttons |
+| Standalone mode | Open `scoreboard.html` directly — full JS game engine runs locally, no server needed |
+
+### Keyboard Shortcuts
+
+| Key | Action |
+|---|---|
+| `g` | Green short press (score) |
+| `G` | Green double press (undo) |
+| `b` | Blue short press (score) |
+| `B` | Blue double press (undo) |
+| `r` / `R` | Reset (quad-press equivalent) |
+| `c` / `C` | Connect both buttons |
+| `S` | Toggle sim panel |
+| `F` | Toggle fullscreen |
+
+---
+
+## Crash Recovery
+
+Game state is saved to a SQLite database (`~/pingpong/game_state.db`) after every button press. If the server crashes or the Pi loses power mid-game, it automatically restores the exact score, serve position, and game count on next startup. A deliberate quad-press reset marks the database as clean so recovery does not trigger after an intentional reset.
+
+---
+
+## Logging
+
+| Log | Location | Format |
+|---|---|---|
+| Human-readable game log | `~/pingpong/logs/game_YYYYMMDD.log` | Plain English with timestamps, rotates daily, 14-day retention |
+| System / crash log | `journalctl -u pingpong` | systemd journal |
+| Match history | `~/pingpong/game_state.db` → `match_history` table | SQLite — queryable by date, winner, duration, scores |
+
+```bash
+# Follow the live game log
+tail -f ~/pingpong/logs/game_$(date +%Y%m%d).log
+
+# View recent server output
+sudo journalctl -u pingpong -n 50 --no-pager
+
+# Query match history
+sqlite3 ~/pingpong/game_state.db \
+  "SELECT timestamp, winner, race_to, best_of, duration_s FROM match_history ORDER BY id DESC LIMIT 10;"
+```
+
+---
+
+## Systemd Service
+
+```bash
+# Check status
+sudo systemctl status pingpong
+
+# Follow live logs
+sudo journalctl -u pingpong -f
+
+# Restart
+sudo systemctl restart pingpong
+```
 
 ---
 
@@ -292,20 +324,16 @@ Internal pull-up is enabled in firmware — no resistor needed.
 
 | Symptom | Check |
 |---|---|
-| ESP32 can't see the AP | `nmcli con show PingPongHotspot` — confirm `GENERAL.STATE: activated` |
-| MQTT connection refused | `sudo systemctl status mosquitto` — confirm listening on `0.0.0.0:1883` |
-| Pi not at 192.168.4.1 | `ip addr show wlan0` — re-run `sudo nmcli con up PingPongHotspot` |
-| Display not updating | Confirm `/IT8951/IT8951` exists and is executable (`ls -la /IT8951/`) |
-| ImageMagick BMP error | Edit `/etc/ImageMagick-7/policy.xml` — set `rights="read\|write"` for `path` pattern `@*` |
-| `pip install` fails | Add `--break-system-packages` or use a venv |
-
----
-
-## Log Files
-
-Each run writes a timestamped log to `/home/jim/logs/<epoch>.txt`.
-
-Format includes serve headers, score events, undo records, change-of-serve markers, and full match summaries.
+| ESP32 can't connect to AP | Confirm SSID `pingpong` and password match. `sudo systemctl status hostapd` |
+| No MQTT messages arriving | `sudo systemctl status mosquitto` — must be running on `0.0.0.0:1883` |
+| `wlan0` has no IP after reboot | `ip addr show wlan0` — if missing `10.11.12.1`, run `sudo ifup wlan0` |
+| Scoreboard not loading | `sudo systemctl status pingpong` — look for Python errors |
+| Server crash-loops on start | `sudo journalctl -u pingpong -n 30` — usually a missing Python package |
+| Firefox doesn't open on TV | `~/pingpong/launch_kiosk.sh` polls until the server responds — check server first |
+| Mouse cursor visible on TV | `sudo raspi-config` → Advanced → Wayland → switch to X11, then reboot |
+| Screen goes blank | Add `@xset s off` / `@xset -dpms` / `@xset s noblank` to `~/.config/lxsession/LXDE-pi/autostart` |
+| Battery always shows `—` | Voltage divider not wired to A0, or set `BAT_ADC_ENABLED false` in firmware |
+| No COM port in Arduino IDE | Install CH340 or CP2102 USB driver. Try holding BOOT while plugging in USB |
 
 ---
 
