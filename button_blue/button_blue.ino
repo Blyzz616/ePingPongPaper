@@ -1,166 +1,210 @@
 /*
  * =============================================================================
- *  Ping-Pong Scorer – BLUE Button Firmware
+ *  Ping-Pong Scorer — BLUE Button Firmware  v3.0
  *  Hardware: Seeed Studio XIAO ESP32-C6
  * =============================================================================
  *
- *  Identical logic to the GREEN button; only the MQTT client ID,
- *  topics, and serial labels differ.
- *
- *  BEHAVIOUR
- *  ---------
- *  Boot:
- *    1. Connect to the Pi's Wi-Fi access point.
- *    2. Connect to the MQTT broker on the Pi (192.168.4.1:1883).
- *    3. Publish "connected" to status/blue.
- *
- *  Button events (published to "button/blue"):
- *    short   – single tap
- *    double  – two taps within DOUBLE_MS
- *    long    – held >= LONG_MS
- *
  *  WIRING
  *  ------
- *  Button between GPIO D1 and GND. Internal pull-up; LOW = pressed.
+ *  Button  : D1 → GND  (internal pull-up, LOW = pressed)
+ *  Speaker : D2 → GND  (passive buzzer, beeps on every press)
+ *  Battery : BAT+ → 100kΩ → A0 → 100kΩ → GND  (voltage divider)
+ *            Set BAT_ADC_ENABLED false if divider not wired.
  *
- *  DEPENDENCIES  (Arduino Library Manager)
- *  ────────────────────────────────────────
- *  - PubSubClient  by Nick O'Leary
- *  - WiFi (built-in)
+ *  BUTTON EVENTS  (published to "button/blue")
+ *  ─────────────────────────────────────────────
+ *  short   — 1 tap, gap expired
+ *  double  — 2 taps within TAP_GAP_MS (undo)
+ *  reset   — 4 taps within TAP_GAP_MS each (full reset → jumps to rule select)
+ *  (3 taps treated as double)
+ *
+ *  PUBLISHED TOPICS
+ *  ─────────────────
+ *  button/blue     — short / double / reset
+ *  status/blue     — "connected" (retained, on every WiFi reconnect)
+ *  heartbeat/blue  — "ok" every HEARTBEAT_MS
+ *  battery/blue    — "85" (percent, 0-100, or "-1" if not wired)
+ *
+ *  DEPENDENCIES
+ *  ─────────────
+ *  PubSubClient by Nick O'Leary  (Arduino Library Manager)
  *
  *  BOARD PACKAGE
  *  ─────────────
- *  Seeed XIAO ESP32-C6 package URL:
  *  https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
+ *  → Seeed XIAO ESP32C6
  * =============================================================================
  */
 
 #include <WiFi.h>
 #include <PubSubClient.h>
 
-// ── Wi-Fi credentials (Pi's AP) ───────────────────────────────────────────────
-const char* WIFI_SSID     = "PingPongScorer";
-const char* WIFI_PASSWORD = "pingpong123";
-
-// ── MQTT broker (Pi's AP gateway IP) ─────────────────────────────────────────
-const char* MQTT_SERVER   = "192.168.4.1";
+// ── Credentials ───────────────────────────────────────────────────────────────
+const char* WIFI_SSID     = "pingpong";
+const char* WIFI_PASSWORD = "";          // ← your AP password
+const char* MQTT_SERVER   = "10.11.12.1";
 const int   MQTT_PORT     = 1883;
 const char* MQTT_CLIENT   = "button_blue";
 const char* TOPIC_BUTTON  = "button/blue";
 const char* TOPIC_STATUS  = "status/blue";
+const char* TOPIC_HB      = "heartbeat/blue";
+const char* TOPIC_BAT     = "battery/blue";
 
-// ── Button pin ────────────────────────────────────────────────────────────────
-const int   BUTTON_PIN    = D1;
+// ── Pins ──────────────────────────────────────────────────────────────────────
+const int BUTTON_PIN  = D1;
+const int SPEAKER_PIN = D2;
+const int BAT_ADC_PIN = A0;
 
-// ── Timing ───────────────────────────────────────────────────────────────────
-const unsigned long DEBOUNCE_MS = 40;
-const unsigned long DOUBLE_MS   = 350;
-const unsigned long LONG_MS     = 700;
+// ── Feature flags ─────────────────────────────────────────────────────────────
+#define BAT_ADC_ENABLED true    // set false if voltage divider not wired
 
-// ── State ─────────────────────────────────────────────────────────────────────
+// ── Timing (ms) ───────────────────────────────────────────────────────────────
+const unsigned long DEBOUNCE_MS       =   40;
+const unsigned long TAP_GAP_MS        =  500;  // max gap between taps in sequence
+const unsigned long MQTT_RECONNECT_MS = 3000;
+const unsigned long HEARTBEAT_MS      = 5000;
+const unsigned long BATTERY_MS        = 30000; // send battery every 30s
+
+// ── MQTT state ────────────────────────────────────────────────────────────────
 WiFiClient   wifiClient;
-PubSubClient mqttClient(wifiClient);
+PubSubClient mqtt(wifiClient);
+volatile bool wifiJustConnected = false;
+unsigned long lastMqttAttempt   = 0;
+unsigned long lastHeartbeat     = 0;
+unsigned long lastBattery       = 0;
 
-enum BtnState { IDLE, PRESSED, WAIT_DOUBLE };
-BtnState      btnState      = IDLE;
-unsigned long pressStart    = 0;
-unsigned long releaseTime   = 0;
-bool          longFired     = false;
+// ── Button FSM ────────────────────────────────────────────────────────────────
+enum BtnState { IDLE, PRESSED, WAIT_NEXT };
+BtnState      btnState       = IDLE;
+int           tapCount       = 0;
+unsigned long lastReleaseMs  = 0;
 
-unsigned long lastReconnect = 0;
-const unsigned long RECONNECT_INTERVAL = 3000;
+// =============================================================================
+//  BEEP
+// =============================================================================
 
-// ─────────────────────────────────────────────────────────────────────────────
-
-void setup() {
-  Serial.begin(115200);
-  delay(200);
-  Serial.println("[BLUE] Ping-Pong button booting…");
-
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-
-  connectWiFi();
-  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
-  mqttClient.setCallback(mqttCallback);
-  connectMQTT();
+void beep(int freq = 2000, int durationMs = 80) {
+  tone(SPEAKER_PIN, freq, durationMs);
 }
 
-// ── Wi-Fi ─────────────────────────────────────────────────────────────────────
+// =============================================================================
+//  BATTERY
+// =============================================================================
 
-void connectWiFi() {
-  Serial.printf("[BLUE] Connecting to AP '%s'…", WIFI_SSID);
+int readBatteryPercent() {
+#if BAT_ADC_ENABLED
+  // Voltage divider: BAT+ → 100kΩ → A0 → 100kΩ → GND
+  // Measured voltage = battery voltage / 2
+  // analogReadMilliVolts returns 0-3300mV for the ADC input
+  int mv = analogReadMilliVolts(BAT_ADC_PIN) * 2;
+  // LiPo: 3000mV = 0%,  4200mV = 100%
+  int pct = (int)((mv - 3000) * 100.0 / (4200 - 3000));
+  return constrain(pct, 0, 100);
+#else
+  return -1;  // not wired
+#endif
+}
+
+// =============================================================================
+//  Wi-Fi
+// =============================================================================
+
+void onWifiEvent(WiFiEvent_t event) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.println("[BLUE] WiFi: associated.");
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.printf("[BLUE] WiFi: IP %s\n", WiFi.localIP().toString().c_str());
+      wifiJustConnected = true;
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      Serial.println("[BLUE] WiFi: disconnected — auto-retry.");
+      break;
+    default: break;
+  }
+}
+
+void initWiFi() {
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(true);
   WiFi.mode(WIFI_STA);
+  WiFi.onEvent(onWifiEvent);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-
-  unsigned long t = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(250);
-    Serial.print(".");
-    if (millis() - t > 20000) {
-      Serial.println("\n[BLUE] Wi-Fi timeout, restarting…");
-      ESP.restart();
-    }
-  }
-  Serial.printf("\n[BLUE] Wi-Fi connected. IP: %s\n",
-                WiFi.localIP().toString().c_str());
+  Serial.printf("[BLUE] WiFi: connecting to '%s'…\n", WIFI_SSID);
 }
 
-// ── MQTT ──────────────────────────────────────────────────────────────────────
+// =============================================================================
+//  MQTT
+// =============================================================================
 
-void connectMQTT() {
-  while (!mqttClient.connected()) {
-    Serial.print("[BLUE] Connecting to MQTT…");
-    if (mqttClient.connect(MQTT_CLIENT)) {
-      Serial.println(" connected.");
-      mqttClient.publish(TOPIC_STATUS, "connected", true);
-      mqttClient.subscribe(TOPIC_STATUS);
-    } else {
-      Serial.printf(" failed (rc=%d), retry in 3s\n", mqttClient.state());
-      delay(3000);
-    }
-  }
+void mqttCallback(char* topic, byte* payload, unsigned int len) {}
+
+void announceConnected() {
+  mqtt.publish(TOPIC_STATUS, "connected", true);  // retained
+  Serial.println("[BLUE] MQTT: announced connected.");
 }
 
 void ensureMQTT() {
-  if (!mqttClient.connected()) {
-    unsigned long now = millis();
-    if (now - lastReconnect > RECONNECT_INTERVAL) {
-      lastReconnect = now;
-      Serial.println("[BLUE] MQTT lost, reconnecting…");
-      if (WiFi.status() != WL_CONNECTED) connectWiFi();
-      if (mqttClient.connect(MQTT_CLIENT)) {
-        mqttClient.publish(TOPIC_STATUS, "connected", true);
-        mqttClient.subscribe(TOPIC_STATUS);
-      }
-    }
-  }
-}
-
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  // Reserved for future use (e.g., haptic feedback commands from Pi)
-}
-
-// ── Publish ───────────────────────────────────────────────────────────────────
-
-void publishEvent(const char* event) {
-  Serial.printf("[BLUE] → %s\n", event);
-  if (mqttClient.connected()) {
-    mqttClient.publish(TOPIC_BUTTON, event);
+  if (mqtt.connected()) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  unsigned long now = millis();
+  if (now - lastMqttAttempt < MQTT_RECONNECT_MS) return;
+  lastMqttAttempt = now;
+  Serial.print("[BLUE] MQTT: connecting…");
+  if (mqtt.connect(MQTT_CLIENT)) {
+    Serial.println(" OK.");
+    announceConnected();
   } else {
-    Serial.println("[BLUE] MQTT not connected; event dropped.");
+    Serial.printf(" failed (rc=%d).\n", mqtt.state());
   }
 }
 
-// ── Button FSM ────────────────────────────────────────────────────────────────
+void publishEvent(const char* ev) {
+  Serial.printf("[BLUE] → %s\n", ev);
+  if (mqtt.connected()) mqtt.publish(TOPIC_BUTTON, ev);
+  else Serial.println("[BLUE] MQTT not connected — dropped.");
+}
+
+// =============================================================================
+//  PERIODIC TASKS
+// =============================================================================
+
+void sendHeartbeat() {
+  if (!mqtt.connected()) return;
+  mqtt.publish(TOPIC_HB, "ok");
+}
+
+void sendBattery() {
+  if (!mqtt.connected()) return;
+  int pct = readBatteryPercent();
+  char buf[8];
+  itoa(pct, buf, 10);
+  mqtt.publish(TOPIC_BAT, buf);
+  Serial.printf("[BLUE] Battery: %d%%\n", pct);
+}
+
+// =============================================================================
+//  BUTTON FSM
+// =============================================================================
 /*
- * Non-blocking press detector. See green button comments for full description.
+ *  Tap counting:
+ *    1 tap  → "short"
+ *    2 taps → "double"  (undo)
+ *    3 taps → "double"  (treat as double, discard extra)
+ *    4 taps → "reset"   (full reset, jumps to rule selection)
  *
- *  IDLE       → LOW detected            → PRESSED
- *  PRESSED    → held >= LONG_MS         → publish "long"
- *  PRESSED    → release (no long)       → WAIT_DOUBLE
- *  WAIT_DOUBLE → second LOW in window   → publish "double" → IDLE
- *  WAIT_DOUBLE → window expires         → publish "short"  → IDLE
+ *  Each tap must begin within TAP_GAP_MS of the previous release.
+ *  Beep fires immediately on each button press-down for feedback.
  */
+
+void dispatchTaps() {
+  if      (tapCount == 1) publishEvent("short");
+  else if (tapCount == 2) publishEvent("double");
+  else if (tapCount == 3) publishEvent("double");  // 3-tap = double
+  else if (tapCount >= 4) publishEvent("reset");
+  tapCount = 0;
+}
 
 void handleButton() {
   bool pressed = (digitalRead(BUTTON_PIN) == LOW);
@@ -169,54 +213,88 @@ void handleButton() {
   switch (btnState) {
 
     case IDLE:
+      // Expire tap window while idle
+      if (tapCount > 0 && (now - lastReleaseMs) >= TAP_GAP_MS) {
+        dispatchTaps();
+      }
       if (pressed) {
         delay(DEBOUNCE_MS);
         if (digitalRead(BUTTON_PIN) == LOW) {
-          pressStart = millis();
-          longFired  = false;
-          btnState   = PRESSED;
+          beep();
+          btnState = PRESSED;
         }
       }
       break;
 
     case PRESSED:
-      if (!longFired && (now - pressStart >= LONG_MS)) {
-        publishEvent("long");
-        longFired = true;
-      }
       if (!pressed) {
-        if (longFired) {
+        tapCount++;
+        lastReleaseMs = millis();
+        if (tapCount >= 4) {
+          publishEvent("reset");
+          tapCount = 0;
           btnState = IDLE;
         } else {
-          releaseTime = now;
-          btnState    = WAIT_DOUBLE;
+          btnState = WAIT_NEXT;
         }
       }
       break;
 
-    case WAIT_DOUBLE:
+    case WAIT_NEXT:
       if (pressed) {
         delay(DEBOUNCE_MS);
         if (digitalRead(BUTTON_PIN) == LOW) {
-          publishEvent("double");
-          while (digitalRead(BUTTON_PIN) == LOW) {
-            mqttClient.loop();
-            delay(10);
-          }
-          btnState = IDLE;
+          beep();
+          btnState = PRESSED;
         }
-      } else if (now - releaseTime >= DOUBLE_MS) {
-        publishEvent("short");
+      } else if (now - lastReleaseMs >= TAP_GAP_MS) {
+        dispatchTaps();
         btnState = IDLE;
       }
       break;
   }
 }
 
-// ── Main loop ─────────────────────────────────────────────────────────────────
+// =============================================================================
+//  Setup / Loop
+// =============================================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("[BLUE] Ping-Pong button v3.0 booting…");
+
+  pinMode(BUTTON_PIN,  INPUT_PULLUP);
+  pinMode(SPEAKER_PIN, OUTPUT);
+
+  // startup beep
+  beep(1500, 150);
+
+  mqtt.setServer(MQTT_SERVER, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
+
+  initWiFi();
+}
 
 void loop() {
+  if (wifiJustConnected) {
+    wifiJustConnected = false;
+    lastMqttAttempt   = 0;
+  }
+
   ensureMQTT();
-  mqttClient.loop();
+  mqtt.loop();
   handleButton();
+
+  unsigned long now = millis();
+
+  if (now - lastHeartbeat >= HEARTBEAT_MS) {
+    lastHeartbeat = now;
+    sendHeartbeat();
+  }
+
+  if (now - lastBattery >= BATTERY_MS) {
+    lastBattery = now;
+    sendBattery();
+  }
 }
