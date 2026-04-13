@@ -202,6 +202,7 @@ After reboot the Pi broadcasts the `pingpong` Wi-Fi network, starts the scoring 
 |---|---|
 | Short tap | Score a point / advance menu |
 | Double tap | Undo last point |
+| Triple tap | Handled as a double-tap (undo) |
 | Quad-tap (4× within 500 ms each) | Full reset → jumps straight to rule selection |
 
 **Green button** = top player on screen (far end of table)
