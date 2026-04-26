@@ -76,7 +76,7 @@ Large 85 mm recordable talking buttons with built-in LEDs — one green, one blu
 
 ### Batteries *(×2 — one per button)*
 
-<img width="1198" height="1030" alt="image" src="https://github.com/user-attachments/assets/6e42a5bc-edb4-4daa-b363-187f18e5bab4" alt="HAWK'S WORK LiPo Battery" width="300"/>
+<img width="360" height="309" alt="image" src="https://github.com/user-attachments/assets/6e42a5bc-edb4-4daa-b363-187f18e5bab4" alt="HAWK'S WORK LiPo Battery" />
 
 Each button runs from a 3.7V LiPo cell. To recharge, remove the ESP32 from the button housing and charge the battery via USB. The ESP32 monitors supply voltage via ADC and reports approximate battery level to the scoreboard.
 
