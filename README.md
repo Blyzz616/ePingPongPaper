@@ -58,7 +58,7 @@ An ultra-compact Wi-Fi module soldered inside each score button. Connects to the
 
 ### Score Buttons *(×2)*
 
-<img width="887" height="805" alt="image" src="https://github.com/user-attachments/assets/2fbcae6a-5147-4c4e-a297-c42e77e6b4de" alt="Recordable Talking Button" width="300" />
+<img width="360" height="326" alt="image" src="https://github.com/user-attachments/assets/2fbcae6a-5147-4c4e-a297-c42e77e6b4de" alt="Recordable Talking Button" />
 
 Large 85 mm recordable talking buttons with built-in LEDs — one green, one blue. The original AAA battery compartment houses the ESP32-C6 and LiPo battery. The original button mechanism is wired to the ESP32's GPIO. A passive speaker on D2 beeps on every press for tactile confirmation.
 
